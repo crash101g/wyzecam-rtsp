@@ -657,7 +657,8 @@ class CameraFeed(threading.Thread):
         size = self.w * self.h * 3 // 2
         buf = bytearray(size)
         mv = memoryview(buf)
-        delay = 2
+        delay = 2          # back-off when a camera can't connect / sends nothing: 2,4,8,16,30 s
+        quick = 2          # back-off when it WAS streaming before it dropped: 2,4,8,8 s
         while not self.stop.is_set():
             if self.paused:                            # hidden: don't hold a camera session
                 self.stop.wait(0.5)
@@ -666,6 +667,7 @@ class CameraFeed(threading.Thread):
             started = self.started = time.time()
             errlines = []
             frames_before = self.frames
+            first_frame = None             # time of this session's first frame
             self.proc = popen_ffmpeg(
                 camera_ffmpeg_cmd(self.url(), self.w, self.h, self.hwaccel, self.keep_every,
                                   self.gpu_scale),
@@ -683,6 +685,8 @@ class CameraFeed(threading.Thread):
                         n += r
                     self.frame = bytes(buf)
                     self.last = time.time()
+                    if first_frame is None:
+                        first_frame = self.last
                     self.frames += 1
             except (EOFError, OSError, ValueError):
                 pass
@@ -692,7 +696,7 @@ class CameraFeed(threading.Thread):
             if self.stop.is_set():
                 break
             if self.planned:
-                delay = 2
+                delay = quick = 2
                 continue                               # resync: reconnect right away
             got_video = self.frames > frames_before
             if self.gpu_scale and not got_video and any(
@@ -706,14 +710,27 @@ class CameraFeed(threading.Thread):
                 delay = 2
                 continue
             self.drops += 1
+            ran = time.time() - started
+            # "Had video" = this session streamed for at least 3 s before it dropped.
+            had_video = first_frame is not None and self.last - first_frame >= 3
             if self._maybe_fallback(got_video):
                 self.save_needed = True
-                delay = 2
-            if time.time() - started > 60:
-                delay = 2
-            log(f"[{self.name}] dropped: {drop_reason(errlines)} — reconnecting in {delay}s")
-            self.stop.wait(delay)
-            delay = min(delay * 2, 30)                 # back off: 2, 4, 8, 16, 30, 30 ... seconds
+                delay = quick = 2
+            if ran > 60:                               # it was healthy for a while: start over
+                delay = quick = 2
+            if had_video and ran <= 60:
+                # It works but keeps dropping (weak Wi-Fi): retry fast so the tile isn't grey
+                # for long. 2, 4, 8, 8 ... s
+                wait = quick
+                quick = min(quick * 2, 8)
+                delay = 2                              # a later failed connect backs off from 2 s
+            else:
+                # Couldn't connect or sent nothing: back off so we don't hammer the camera.
+                # 2, 4, 8, 16, 30, 30 ... s
+                wait = delay
+                delay = min(delay * 2, 30)
+            log(f"[{self.name}] dropped: {drop_reason(errlines)} — reconnecting in {wait}s")
+            self.stop.wait(wait)
 
     def restart(self, planned=False):
         """Reconnect this camera (from another thread, so the grid never waits)."""
