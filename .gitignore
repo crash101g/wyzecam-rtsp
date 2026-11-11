@@ -1,0 +1,4 @@
+cameras.json
+*.log
+wyzecams.py
+__pycache__/
