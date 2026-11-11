@@ -4,8 +4,22 @@ View your Wyze cameras' built-in RTSP streams in one live grid on **Linux, macOS
 no Wyze app and no cloud. It scans your network, finds the cameras, and shows them tiled in a
 single window with names, auto-reconnect, and live rearranging.
 
+![Nine estate cameras live in one window](screenshots/hero.jpg)
+
 > **Important:** this only works with cameras that provide an RTSP stream, and it has only been
 > tested with Wyze Cams. Other RTSP cameras may need a different port or stream path.
+
+## Screenshots
+
+| | |
+|---|---|
+| ![Selecting a camera to rearrange](screenshots/arrange.jpg) | ![One camera zoomed to fill the window](screenshots/zoom.jpg) |
+| **Arrange live:** press 1–9 to pick a camera (yellow border), then use the arrow keys to move it and **s** to save the layout. | **Zoom:** press **z** to fill the window with the selected camera, and **z** again to go back to the grid. |
+| ![A camera reconnecting shows as a dark grey tile](screenshots/reconnecting.jpg) | ![On-screen key help](screenshots/help.jpg) |
+| **Keeps going:** a camera that drops turns dark grey and reconnects by itself. The other cameras keep playing. | **Help on screen:** press **h** to show every key. |
+
+*These are illustrated mockups. The estate scenes are drawings, but the layout, name labels,
+selection border, grey reconnecting tile and on-screen messages match what the app shows.*
 
 ## 1. Turn on RTSP on each camera
 
