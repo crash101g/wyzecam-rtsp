@@ -86,6 +86,40 @@ A **dark grey tile** means that camera has no live video right now. It keeps ret
 - GPU decoding is used where available: VA-API on Linux, VideoToolbox on macOS, D3D11 on Windows.
 - Logs: `wyzecam-rtsp.log` (events) and `wyzecam-rtsp-ffmpeg.log` (details, passwords removed).
 
+## Using it alongside the Wyze app, and during internet outages
+
+**Can I still use the Wyze phone app?** Yes. Turning on RTSP is just a setting, and the Wyze app
+keeps working: motion alerts, event clips, and settings are unaffected. Live view in the app is a
+second, separate stream from the camera, though, so be aware of two things:
+
+- On cameras with weak Wi-Fi, opening live view on your phone can make that camera's grid tile drop
+  for a moment. The grid reconnects it on its own.
+- Some owners report that the Wyze app's live view becomes unreliable on certain firmware while RTSP
+  is streaming, notably the [Cam v4 RTSP beta](https://forums.wyze.com/t/wyze-cam-v4-firmware-beta-test-7-27-2026/344026?page=3)
+  and the [February 2026 Cam v3 / Pan v3 firmware](https://forums.wyze.com/t/wyze-firmware-updates-2-2-2026/340669?page=3).
+  If that happens to you, it's the camera firmware, not this tool. Check each camera's live view in
+  the app while the grid is running.
+
+**Is the video local? Does it work without internet?** The video goes **directly from each camera to
+your computer over your home network**. It never passes through the internet or Wyze's servers, and
+this tool needs no internet connection.
+
+Whether the *cameras* keep streaming RTSP when your internet goes down is a separate question:
+
+- **While the cameras stay powered on, owners report that RTSP keeps working.** For example, a
+  [Pan v3 owner unplugged their internet](https://forums.wyze.com/t/isp-down-and-no-local-access/343086)
+  and could still stream over RTSP while the Wyze app showed every camera offline, and another
+  [kept RTSP through a 16-hour ISP outage](https://forums.wyze.com/t/can-you-use-cams-without-internet/24471?page=3).
+- **A camera that restarts or loses power while the internet is down may not come back.** Wyze cams
+  check in with Wyze's cloud when they start up, and reports
+  [differ](https://forums.wyze.com/t/rtsp-local-availability-when-internet-or-wyze-servers-down/55033)
+  on whether RTSP returns without it.
+- **Cam v4:** no offline reports found yet for its newer RTSP firmware.
+
+**Test it on your own cameras:** with the grid running, block the cameras' internet access in your
+router for an hour and watch the tiles. Then restart one camera while it's still blocked and see
+whether it returns.
+
 ## Checklist for a first run on macOS / Windows
 
 These parts were tested on Linux and simulated for macOS/Windows, but haven't yet run on a real
