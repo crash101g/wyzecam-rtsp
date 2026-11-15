@@ -25,6 +25,16 @@ OTHER COMMANDS
   ./wyzecam-rtsp.py name                name cameras while watching each one live
   ./wyzecam-rtsp.py arrange             choose the grid order and which cameras are shown
   ./wyzecam-rtsp.py test 243            find the best stream/decoder for one camera
+  ./wyzecam-rtsp.py serve --web --record /mnt/nas/cams
+                                        no window: browser view and/or recording (servers)
+  ./wyzecam-rtsp.py ha                  print Home Assistant setup for each camera
+
+RECORDING AND BROWSER VIEW (grid or 'serve'; each camera still uses ONE camera session)
+  --record DIR       record every camera into DIR/<camera name>/ (.mkv, video copied as-is)
+  --keep DAYS        delete recordings older than DAYS (default 7, 0 = keep forever)
+  --segment MIN      minutes per recording file (default 5)
+  --web [PORT]       browser view at http://this-pc:PORT/ (default 8080), RTSP login required
+  --web-bind ADDR    127.0.0.1 = only this computer (default: whole LAN)
 
 PLAYBACK SWITCHES
   -c, --cam LIST     only these cameras (comma-separated; names, IPs, or last IP number;
@@ -101,6 +111,14 @@ MAIN, SUB = "stream0", "stream1"
 VERBOSE = False
 STALL_SECS = 8          # a camera that stops sending frames this long gets reconnected
 FIRST_FRAME_SECS = 25   # allowance for the first frame after (re)connecting
+# Recording (--record): video is copied as-is (no re-encoding) into .mkv files of this length.
+REC_SEGMENT_MIN = 5
+REC_KEEP_DAYS = 7       # recordings older than this are deleted (--keep, 0 = keep forever)
+# Browser view (--web): JPEG snapshots, at most this wide, of every Nth camera frame.
+WEB_PORT = 8080
+WEB_WIDTH = 960
+WEB_EVERY = 2           # Wyze cams send ~20 fps -> ~10 fps in the browser
+WEB_QUALITY = 6         # JPEG quality: 2 (best, biggest) .. 31 (worst, smallest)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -114,7 +132,19 @@ def popen_ffmpeg(cmd, **kw):
     On Windows that means giving it a stdin pipe (it quits cleanly when sent 'q')."""
     if IS_WIN:
         kw["stdin"] = subprocess.PIPE
+    else:
+        # Own session: Ctrl+C in the terminal reaches only us, and we then stop each ffmpeg
+        # with ONE SIGINT. A second SIGINT makes ffmpeg quit without finishing its files.
+        kw["start_new_session"] = True
     return subprocess.Popen(cmd, **kw)
+
+
+def _drain(pipe):
+    try:
+        while pipe.read(65536):
+            pass
+    except (OSError, ValueError):
+        pass
 
 
 def stop_ffmpeg(p, grace=3):
@@ -125,6 +155,13 @@ def stop_ffmpeg(p, grace=3):
     'q' (quit) key on its stdin. Either way, kill it if it hasn't exited after `grace` s."""
     if p is None or p.poll() is not None:
         return
+    if getattr(p, "_stop_sent", False):        # already asked (another thread): just wait
+        try:
+            p.wait(timeout=grace + 2)
+        except subprocess.TimeoutExpired:
+            pass
+        return
+    p._stop_sent = True
     try:
         if IS_WIN:
             if p.stdin:
@@ -241,6 +278,13 @@ def redact(url):
 
 
 # --------------------------------------------------------------------------- scan
+def safe_name(name):
+    """A camera name usable as a folder/file name on Linux, macOS and Windows (and inside
+    ffmpeg's strftime pattern, so no '%')."""
+    s = re.sub(r'[<>:"/\\|?*%\x00-\x1f]+', "_", name).strip(" .")
+    return s or "camera"
+
+
 def port_open(ip, port, timeout=0.6):
     try:
         with socket.create_connection((str(ip), port), timeout=timeout):
@@ -523,12 +567,18 @@ def play_windows(cams, user, password, path):
         os.unlink(conf.name)
 
 
-def input_args(url, hwaccel=True, gpu_frames=False):
+def input_args(url, hwaccel=True, gpu_frames=False, wallclock=False, progress=False):
     """ffmpeg input options shared by the grid and the 'test' command.
-    gpu_frames keeps decoded frames on the GPU (for scaling there)."""
+    gpu_frames keeps decoded frames on the GPU (for scaling there).
+    wallclock stamps packets with the arrival time (Wyze streams have no usable timestamps,
+    which recordings need). progress reports frame counts on stdout (headless liveness)."""
     a = ["-hide_banner"]
     if not IS_WIN:
         a.append("-nostdin")       # Windows keeps stdin: that's how we ask ffmpeg to quit ('q')
+    if progress:
+        a += ["-nostats", "-progress", "pipe:1"]
+    if wallclock:
+        a += ["-use_wallclock_as_timestamps", "1"]
     if hwaccel:
         # GPU decoding: VA-API on Linux (Intel/AMD); "auto" picks VideoToolbox on macOS and
         # D3D11VA/DXVA2 on Windows. All fall back to the CPU if the GPU can't do it.
@@ -556,22 +606,45 @@ def drawtext_escape(t):
     return t.replace("\\", "\\\\").replace("'", "’").replace(":", "\\:").replace("%", "\\%")
 
 
-def camera_ffmpeg_cmd(url, tile_w, tile_h, hwaccel=True, keep_every=2, gpu_scale=False):
-    """One ffmpeg per camera: decode, keep every Nth frame (counted, since Wyze streams have
-    no usable timestamps), scale to the tile, emit raw YUV420 frames.
+def camera_ffmpeg_cmd(url, tile_w, tile_h, hwaccel=True, keep_every=2, gpu_scale=False,
+                      tiles=True, rec_pattern=None, rec_segment=300, jpeg_port=None):
+    """One ffmpeg per camera, i.e. ONE camera session, with up to three outputs:
+      tiles       decode, keep every Nth frame (counted, since Wyze streams have no usable
+                  timestamps), scale to the tile, raw YUV420 frames on stdout (the grid)
+      rec_pattern copy the video as-is (no re-encoding) into clock-aligned .mkv segments
+      jpeg_port   JPEG snapshots for the browser view, sent to a local TCP port
     gpu_scale: decode AND shrink on the GPU (VA-API), copy only the small tile back."""
-    gpu = hwaccel and gpu_scale and IS_LINUX      # GPU scaling is VA-API (Linux) only
-    vf = []
-    if keep_every > 1:
-        vf.append(f"select='not(mod(n\\,{keep_every}))'")
-    if gpu:
-        vf += [f"scale_vaapi=w={tile_w}:h={tile_h}:format=nv12", "hwdownload", "format=nv12"]
-        # -pix_fmt yuv420p below converts the small tile on the CPU (cheap at tile size)
-    else:
-        vf.append(f"scale={tile_w}:{tile_h}")
-    return ["ffmpeg", "-loglevel", "error" if not VERBOSE else "warning", *input_args(url, hwaccel, gpu),
-            "-an", "-vf", ",".join(vf), "-fps_mode", "passthrough",
-            "-pix_fmt", "yuv420p", "-f", "rawvideo", "-"]
+    gpu = hwaccel and gpu_scale and IS_LINUX and jpeg_port is None   # VA-API (Linux) only
+    cmd = ["ffmpeg", "-loglevel", "error" if not VERBOSE else "warning",
+           *input_args(url, hwaccel, gpu, wallclock=rec_pattern is not None, progress=not tiles)]
+    if tiles:
+        vf = []
+        if keep_every > 1:
+            vf.append(f"select='not(mod(n\\,{keep_every}))'")
+        if rec_pattern:                # recording adds arrival-time stamps; renumber the tiles
+            vf.append("settb=1/1000,setpts=N*50")
+        if gpu:
+            vf += [f"scale_vaapi=w={tile_w}:h={tile_h}:format=nv12", "hwdownload", "format=nv12"]
+            # -pix_fmt yuv420p below converts the small tile on the CPU (cheap at tile size)
+        else:
+            vf.append(f"scale={tile_w}:{tile_h}")
+        cmd += ["-map", "0:v:0", "-an", "-vf", ",".join(vf), "-fps_mode", "passthrough",
+                "-pix_fmt", "yuv420p", "-f", "rawvideo", "-"]
+    if rec_pattern:
+        cmd += ["-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", "64k",
+                "-f", "segment", "-segment_time", str(rec_segment), "-segment_atclocktime", "1",
+                "-segment_format", "matroska", "-reset_timestamps", "1", "-strftime", "1",
+                rec_pattern]
+    if jpeg_port:
+        cmd += ["-map", "0:v:0", "-an",
+                # fresh, strictly increasing timestamps: the JPEG encoder rejects repeats
+                "-vf", f"select='not(mod(n\\,{WEB_EVERY}))',settb=1/1000,setpts=N*100,"
+                       f"scale='min({WEB_WIDTH},iw)':-2",
+                "-fps_mode", "passthrough", "-pix_fmt", "yuvj420p", "-c:v", "mjpeg",
+                "-q:v", str(WEB_QUALITY), "-f", "image2pipe", f"tcp://127.0.0.1:{jpeg_port}"]
+    if not tiles and not rec_pattern and not jpeg_port:
+        cmd += ["-map", "0:v:0", "-c", "copy", "-f", "null", "-"]
+    return cmd
 
 
 def drop_reason(lines):
@@ -598,8 +671,16 @@ class CameraFeed(threading.Thread):
     can be told to resync (reconnect) to get back to live, and falls back to the
     lighter substream + CPU decoding if the main stream keeps dropping."""
     def __init__(self, cam, user, password, path, tile_w, tile_h, stop, keep_every, cfg_cam=None,
-                 gpu_scale=False):
+                 gpu_scale=False, tiles=True, rec_root=None, rec_segment=300, web=False):
         super().__init__(daemon=True)
+        self.tiles = tiles         # False = headless (no grid): no raw frames are decoded for us
+        self.rec_root = rec_root   # Path: record into rec_root/<camera name>/
+        self.rec_segment = rec_segment
+        self.web = web             # True = also make JPEG snapshots for the browser view
+        self.jpeg = None           # newest JPEG (bytes) and its sequence number
+        self.jpeg_seq = 0
+        self.jpeg_time = 0.0
+        self.jpeg_cond = threading.Condition()
         self.cam, self.user, self.password = cam, user, password
         self.path = cam.get("stream") or path
         self.w, self.h, self.stop = tile_w, tile_h, stop
@@ -621,6 +702,76 @@ class CameraFeed(threading.Thread):
 
     def url(self):
         return rtsp_url(self.cam["ip"], self.cam["port"], self.user, self.password, self.path)
+
+    def rec_pattern(self):
+        """Segment file name pattern for this session (folder created here; ffmpeg won't)."""
+        if not self.rec_root:
+            return None
+        folder = Path(self.rec_root) / safe_name(self.name)
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            log(f"[{self.name}] can't create recording folder {folder}: {e} — not recording")
+            return None
+        return str(folder / f"{safe_name(self.name)}_%Y-%m-%d_%H-%M-%S.mkv")
+
+    def _jpeg_reader(self, listener):
+        """Receive ffmpeg's JPEG stream on a local socket; keep only the newest picture.
+        JPEGs are split on their start/end markers (0xFFD8 / 0xFFD9 never occur inside the
+        compressed data, which escapes 0xFF bytes)."""
+        try:
+            listener.settimeout(FIRST_FRAME_SECS + 15)
+            conn, _ = listener.accept()
+        except OSError:
+            return
+        finally:
+            listener.close()
+        buf = b""
+        try:
+            conn.settimeout(None)
+            while True:                    # until ffmpeg closes it (closing first = broken pipe)
+                chunk = conn.recv(262144)
+                if not chunk:
+                    break
+                buf += chunk
+                while True:
+                    s = buf.find(b"\xff\xd8")
+                    if s < 0:
+                        buf = b""
+                        break
+                    e = buf.find(b"\xff\xd9", s + 2)
+                    if e < 0:
+                        buf = buf[s:]
+                        break
+                    with self.jpeg_cond:
+                        self.jpeg = buf[s:e + 2]
+                        self.jpeg_seq += 1
+                        self.jpeg_time = time.time()
+                        self.jpeg_cond.notify_all()
+                    buf = buf[e + 2:]
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def _progress_reader(self, out, first_frame):
+        """Headless: ffmpeg's -progress lines ('frame=123') tell us video is still arriving."""
+        last_n = 0
+        for raw in out:
+            line = raw.decode(errors="replace").strip()
+            if line.startswith("frame="):
+                try:
+                    n = int(line[6:])
+                except ValueError:
+                    continue
+                if n > last_n:
+                    self.frames += n - last_n
+                    last_n = n
+                    self.last = time.time()
+                    if first_frame[0] is None:
+                        first_frame[0] = self.last
+            if self.stop.is_set():
+                break
 
     def _stderr_reader(self, pipe, sink):
         """Collect ffmpeg's messages for the log file instead of flooding the terminal."""
@@ -667,16 +818,27 @@ class CameraFeed(threading.Thread):
             started = self.started = time.time()
             errlines = []
             frames_before = self.frames
-            first_frame = None             # time of this session's first frame
+            ff = [None]                    # time of this session's first frame
+            listener, jt = None, None
+            if self.web:                   # local port for ffmpeg's JPEG output
+                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                listener.bind(("127.0.0.1", 0))
+                listener.listen(1)
+                jt = threading.Thread(target=self._jpeg_reader, args=(listener,), daemon=True)
+                jt.start()
             self.proc = popen_ffmpeg(
                 camera_ffmpeg_cmd(self.url(), self.w, self.h, self.hwaccel, self.keep_every,
-                                  self.gpu_scale),
+                                  self.gpu_scale, tiles=self.tiles, rec_pattern=self.rec_pattern(),
+                                  rec_segment=self.rec_segment,
+                                  jpeg_port=listener.getsockname()[1] if listener else None),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             et = threading.Thread(target=self._stderr_reader, args=(self.proc.stderr, errlines), daemon=True)
             et.start()
             out = self.proc.stdout
             try:
-                while not self.stop.is_set():
+                if not self.tiles:                     # headless: just follow the progress
+                    self._progress_reader(out, ff)
+                while self.tiles and not self.stop.is_set():
                     n = 0
                     while n < size:                    # read straight into a reused buffer
                         r = out.readinto(mv[n:])
@@ -685,14 +847,24 @@ class CameraFeed(threading.Thread):
                         n += r
                     self.frame = bytes(buf)
                     self.last = time.time()
-                    if first_frame is None:
-                        first_frame = self.last
+                    if ff[0] is None:
+                        ff[0] = self.last
                     self.frames += 1
             except (EOFError, OSError, ValueError):
                 pass
             finally:
+                # keep reading while ffmpeg shuts down, so it can't block on a full pipe
+                # before it finishes the current recording file
+                threading.Thread(target=_drain, args=(out,), daemon=True).start()
                 stop_ffmpeg(self.proc)
                 et.join(timeout=2)
+                if listener is not None:
+                    try:
+                        listener.close()       # unblocks accept() if ffmpeg never connected
+                    except OSError:
+                        pass
+                    jt.join(timeout=2)
+            first_frame = ff[0]
             if self.stop.is_set():
                 break
             if self.planned:
@@ -922,10 +1094,336 @@ def ask_name(current, ip, ipc):
         return None
 
 
-def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=False):
+def watchdog_tick(feeds, next_resync, resync_s, now):
+    for i, f in enumerate(feeds):
+        p = f.proc
+        # watchdog: reconnect a camera that stopped sending
+        if p is not None and p.poll() is None and f.started:
+            since = now - max(f.last, f.started)
+            limit = STALL_SECS if f.last >= f.started else FIRST_FRAME_SECS
+            if since > limit:
+                log(f"[{f.name}] no new video for {since:.0f}s — reconnecting")
+                f.restart()
+        # scheduled resync keeps every camera close to live
+        if now >= next_resync[i]:
+            next_resync[i] = now + resync_s
+            if f.last and now - f.last < STALL_SECS:     # only if it's currently healthy
+                f.restart(planned=True)
+
+
+def save_if_needed(feeds, cfg, cfg_by_ip):
+    if any(f.save_needed for f in feeds):
+        for f in feeds:
+            f.save_needed = False
+        if cfg_by_ip:
+            save(cfg)
+            log("saved the new stream settings to cameras.json")
+
+
+def log_status(feeds, now):
+    log("status: " + "; ".join(
+        f"{f.name} {'LIVE' if f.last and now - f.last < STALL_SECS else 'DOWN'} "
+        f"(drops {f.drops})" for f in feeds))
+
+
+# --------------------------------------------------------------------------- recording
+def check_rec_dir(rec):
+    """Make sure the recording folder exists and is writable before any camera starts."""
+    root = Path(rec["dir"]).expanduser()
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        probe = root / ".wyzecam-rtsp-write-test"
+        probe.write_text("ok")
+        probe.unlink()
+    except OSError as e:
+        die(f"can't write to the recording folder {root}: {e}\n"
+            "       (is the NAS share mounted, and writable by you?)")
+    rec["dir"] = root
+    return root
+
+
+class Pruner(threading.Thread):
+    """Deletes recordings older than `keep_days` (checked at start, then every 30 minutes).
+    Only touches .mkv files this tool made, one folder down from the recording folder."""
+    def __init__(self, root, keep_days, stop):
+        super().__init__(daemon=True)
+        self.root, self.keep, self.stop = Path(root), keep_days, stop
+
+    def run(self):
+        while not self.stop.is_set():
+            cutoff = time.time() - self.keep * 86400
+            removed = 0
+            for f in self.root.glob("*/*_????-??-??_??-??-??.mkv"):
+                try:
+                    if f.stat().st_mtime < cutoff:
+                        f.unlink()
+                        removed += 1
+                except OSError:
+                    pass
+            if removed:
+                log(f"recordings: deleted {removed} file(s) older than {self.keep} day(s)")
+            self.stop.wait(1800)
+
+
+# --------------------------------------------------------------------------- browser view
+WEB_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Wyze Cams</title>
+<style>
+ html,body{margin:0;background:#111;color:#eee;font:14px system-ui,sans-serif;height:100%}
+ #grid{display:grid;gap:4px;padding:4px;box-sizing:border-box;height:100%;
+       grid-template-columns:repeat(var(--cols),1fr);grid-auto-rows:1fr}
+ .tile{position:relative;background:#000;overflow:hidden;cursor:zoom-in;min-height:0}
+ .tile img{width:100%;height:100%;object-fit:contain;display:block}
+ .tile .name{position:absolute;left:8px;top:8px;padding:2px 8px;border-radius:4px;
+             background:rgba(0,0,0,.55);font-weight:600}
+ .tile .name::before{content:"";display:inline-block;width:8px;height:8px;border-radius:50%;
+             background:#3c3;margin-right:6px;vertical-align:1px}
+ .tile.down img{filter:grayscale(1) brightness(.35)}
+ .tile.down .name::before{background:#c33}
+ .tile.zoom{position:fixed;inset:0;z-index:9;cursor:zoom-out;background:#000}
+ body.names-off .name{display:none}
+ @media (max-width:600px){            /* phones: one camera per row, scroll down for more */
+  #grid{height:auto;grid-template-columns:1fr;grid-auto-rows:auto}
+  .tile{aspect-ratio:16/9}
+  #bar{display:none}
+ }
+ #bar{position:fixed;right:8px;bottom:8px;opacity:.5;font-size:12px}
+</style></head><body>
+<div id="grid"></div>
+<div id="bar">click a camera to zoom · n = names · f = fullscreen</div>
+<script>
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function feed(cam, tile, img) {
+  let seq = 0, url = null;
+  for (;;) {
+    try {
+      const r = await fetch(`cam/${cam.id}.jpg?after=${seq}`, {cache: "no-store"});
+      if (r.status !== 200) { tile.classList.add("down"); await sleep(2000); continue; }
+      seq = +r.headers.get("X-Seq");
+      const u = URL.createObjectURL(await r.blob());
+      await new Promise(res => { img.onload = img.onerror = res; img.src = u; });
+      if (url) URL.revokeObjectURL(url);
+      url = u;
+      tile.classList.remove("down");
+    } catch (e) { tile.classList.add("down"); await sleep(2000); }
+  }
+}
+fetch("api/cams", {cache: "no-store"}).then(r => r.json()).then(cams => {
+  const grid = document.getElementById("grid");
+  grid.style.setProperty("--cols", Math.ceil(Math.sqrt(cams.length)) || 1);
+  for (const cam of cams) {
+    const tile = document.createElement("div"), img = new Image(), name = document.createElement("div");
+    tile.className = "tile down"; name.className = "name"; name.textContent = cam.name;
+    tile.title = cam.name; tile.append(img, name); grid.append(tile);
+    tile.onclick = () => tile.classList.toggle("zoom");
+    feed(cam, tile, img);
+  }
+});
+document.addEventListener("keydown", e => {
+  if (e.key === "n") document.body.classList.toggle("names-off");
+  if (e.key === "f") document.fullscreenElement ? document.exitFullscreen()
+                                                 : document.documentElement.requestFullscreen();
+  if (e.key === "Escape") document.querySelectorAll(".zoom").forEach(t => t.classList.remove("zoom"));
+});
+</script></body></html>
+"""
+
+
+def cam_ids(cams):
+    """Short URL ids: the last number of the IP (like -c), or the whole IP if that clashes."""
+    last = [c["ip"].rsplit(".", 1)[1] for c in cams]
+    return [l if last.count(l) == 1 else c["ip"].replace(".", "-") for l, c in zip(last, cams)]
+
+
+class WebView:
+    """Browser view: a small web server that serves each camera's newest JPEG.
+      /              live grid page (works in any browser, phone or TV)
+      /cam/ID.jpg    newest snapshot (?after=SEQ waits for a newer one; used by the page)
+      /cam/ID.mjpg   MJPEG stream, for Home Assistant, VLC, mpv, etc.
+      /api/cams      camera list (JSON)
+    Protected by the RTSP username/password (HTTP Basic auth)."""
+    def __init__(self, feeds, port, bind, user, password, stop):
+        import base64
+        import hmac
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from urllib.parse import parse_qs, urlsplit
+        self.by_id = dict(zip(cam_ids([f.cam for f in feeds]), feeds))
+        expect = ("Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()) if password else None
+        by_id = self.by_id
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def send(self, code, body, ctype="text/plain; charset=utf-8", extra=None):
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                for k, v in (extra or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if expect and not hmac.compare_digest(self.headers.get("Authorization", ""), expect):
+                    return self.send(401, b"login required\n",
+                                     extra={"WWW-Authenticate": 'Basic realm="Wyze Cams"'})
+                u = urlsplit(self.path)
+                m = re.fullmatch(r"/cam/([\w-]+)\.(jpg|mjpg)", u.path)
+                if u.path in ("/", "/index.html"):
+                    return self.send(200, WEB_PAGE.encode(), "text/html; charset=utf-8")
+                if u.path == "/api/cams":
+                    now = time.time()
+                    data = [{"id": i, "name": f.name, "ip": f.cam["ip"],
+                             "live": bool(f.jpeg_time and now - f.jpeg_time < STALL_SECS)}
+                            for i, f in by_id.items()]
+                    return self.send(200, json.dumps(data).encode(), "application/json")
+                if not m or m.group(1) not in by_id:
+                    return self.send(404, b"not found\n")
+                f = by_id[m.group(1)]
+                if m.group(2) == "jpg":
+                    try:
+                        after = int(parse_qs(u.query).get("after", ["0"])[0])
+                    except ValueError:
+                        after = 0
+                    with f.jpeg_cond:
+                        f.jpeg_cond.wait_for(lambda: f.jpeg_seq > after or stop.is_set(), timeout=5)
+                        img, seq, t = f.jpeg, f.jpeg_seq, f.jpeg_time
+                    if img is None or seq <= after or time.time() - t > STALL_SECS:
+                        return self.send(503, b"no live video right now\n")
+                    return self.send(200, img, "image/jpeg", {"X-Seq": str(seq)})
+                # MJPEG stream
+                self.close_connection = True
+                self.send_response(200)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                seq = 0
+                try:
+                    while not stop.is_set():
+                        with f.jpeg_cond:
+                            f.jpeg_cond.wait_for(lambda: f.jpeg_seq > seq or stop.is_set(), timeout=5)
+                            img, new = f.jpeg, f.jpeg_seq
+                        if img is None or new <= seq:
+                            continue
+                        seq = new
+                        self.wfile.write(b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                         + str(len(img)).encode() + b"\r\n\r\n" + img + b"\r\n")
+                        self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+
+        class Server(ThreadingHTTPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+        try:
+            self.httpd = Server((bind, port), Handler)
+        except OSError as e:
+            die(f"can't start the browser view on port {port}: {e} (try --web 8081)")
+        self.port = port
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        if not password:
+            print(" WARNING: no RTSP password set, so the browser view has NO login.")
+
+    def urls(self):
+        host = local_ip() or "localhost"
+        return f"http://{host}:{self.port}/"
+
+    def close(self):
+        try:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+        except OSError:
+            pass
+
+
+def start_extras(feeds, rec, web, user, password, stop):
+    """Start the recording pruner and the browser view (shared by the grid and 'serve')."""
+    web_view = None
+    if rec and rec["keep"] > 0:
+        Pruner(rec["dir"], rec["keep"], stop).start()
+    if web:
+        web_view = WebView(feeds, web["port"], web["bind"], user, password, stop)
+    return web_view
+
+
+def print_extras(rec, web_view, n):
+    if rec:
+        print(f" Recording {n} camera(s) to {rec['dir']}  ({rec['segment'] // 60}-min files, "
+              f"{'kept %s days' % rec['keep'] if rec['keep'] > 0 else 'kept forever'})")
+    if web_view:
+        print(f" Browser view: {web_view.urls()}  (log in with your RTSP username/password)")
+
+
+def run_headless(cams, user, password, path, rec=None, web=None, resync_min=0):
+    """'serve': no window. Record and/or serve the browser view, e.g. on a server or in a
+    container. Each camera still has its own ffmpeg (one camera session) and reconnect loop."""
+    need("ffmpeg")
+    stop = threading.Event()
+    cfg = load_saved()
+    cfg_by_ip = {c["ip"]: c for c in cfg.get("cameras", [])}
+    feeds = [CameraFeed(c, user, password, path, 0, 0, stop, 1, cfg_by_ip.get(c["ip"]),
+                        tiles=False, rec_root=rec and rec["dir"],
+                        rec_segment=rec["segment"] if rec else 300, web=bool(web)) for c in cams]
+    web_view = start_extras(feeds, rec, web, user, password, stop)
+    for f in feeds:
+        f.start()
+    n = len(feeds)
+    resync_s = resync_min * 60 if resync_min > 0 else 0
+    t0 = time.time()
+    next_resync = [t0 + resync_s + i * resync_s / n if resync_s else float("inf") for i in range(n)]
+
+    def shutdown(*_):
+        stop.set()
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    bar = "=" * 64
+    print(bar)
+    print(f" Serving {n} camera(s) with no window: " + ", ".join(c["name"] for c in cams))
+    print_extras(rec, web_view, n)
+    print(" Press Ctrl+C to stop.")
+    print(bar)
+    log(f"serve started: {', '.join(c['name'] for c in cams)}"
+        + (f"; recording to {rec['dir']}" if rec else "")
+        + (f"; browser view on port {web['port']}" if web else ""))
+    last_status = time.time()
+    was_live = [False] * n
+    try:
+        while not stop.is_set():
+            now = time.time()
+            watchdog_tick(feeds, next_resync, resync_s, now)
+            for i, f in enumerate(feeds):
+                live = bool(f.last and now - f.last < STALL_SECS)
+                if live != was_live[i]:
+                    was_live[i] = live
+                    log(f"[{f.name}] {'live' if live else 'no live video'}")
+            save_if_needed(feeds, cfg, cfg_by_ip)
+            if now - last_status > 600:
+                last_status = now
+                log_status(feeds, now)
+            stop.wait(1)
+    finally:
+        stop.set()
+        for f in feeds:
+            stop_ffmpeg(f.proc)
+        if web_view:
+            web_view.close()
+        log("serve stopped")
+
+
+def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=False, rec=None, web=None):
     """One window with every camera tiled. Each camera has its own ffmpeg and reconnect loop,
     so a slow or dead camera never freezes the others. Cameras are resynced (reconnected) on a
-    staggered schedule so none drifts behind live; press r to resync all now."""
+    staggered schedule so none drifts behind live; press r to resync all now.
+    rec / web: also record each camera and/or serve the browser view, from the same session."""
     need("ffmpeg")
     n = len(cams)
     cols = math.ceil(math.sqrt(n))
@@ -939,7 +1437,9 @@ def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=Fal
     cfg = load_saved()
     cfg_by_ip = {c["ip"]: c for c in cfg.get("cameras", [])}
     feeds = [CameraFeed(c, user, password, path, tw, th, stop, keep_every, cfg_by_ip.get(c["ip"]),
-                        gpu_scale) for c in cams]
+                        gpu_scale, rec_root=rec and rec["dir"],
+                        rec_segment=rec["segment"] if rec else 300, web=bool(web)) for c in cams]
+    web_view = start_extras(feeds, rec, web, user, password, stop)
     for f in feeds:
         f.start()
 
@@ -977,6 +1477,8 @@ def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=Fal
           f"Auto-resync: {'every %s min per camera (staggered)' % resync_min if resync_s else 'off'}."
           "  A dark grey tile = that camera has no live video right now.")
     print(" Click the video window first so it receives the keys.")
+    if rec or web_view:
+        print_extras(rec, web_view, n)
     print(bar)
 
     # Pre-render name labels (toggle with n)
@@ -1134,8 +1636,9 @@ def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=Fal
         elif cmd == "hide":
             fi = view.pop(sel[0])
             hidden.append(fi)
-            feeds[fi].paused = True
-            feeds[fi].restart(planned=True)            # disconnect it while hidden
+            if not (feeds[fi].rec_root or feeds[fi].web):   # recording / browser view: stay connected
+                feeds[fi].paused = True
+                feeds[fi].restart(planned=True)            # disconnect it while hidden
             sel[0] = None
             relayout()
             ipc.show(f"Hidden: {cams[fi]['name']}  (a = show all, s = save)", 2500)
@@ -1212,20 +1715,7 @@ def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=Fal
             while not pending.empty():                           # keys pressed since last frame
                 handle(pending.get_nowait())
             now = time.time()
-            for i, f in enumerate(feeds):
-                p = f.proc
-                # watchdog: reconnect a camera that stopped sending
-                if p is not None and p.poll() is None and f.started:
-                    since = now - max(f.last, f.started)
-                    limit = STALL_SECS if f.last >= f.started else FIRST_FRAME_SECS
-                    if since > limit:
-                        log(f"[{f.name}] no new video for {since:.0f}s — reconnecting")
-                        f.restart()
-                # scheduled resync keeps every camera close to live
-                if now >= next_resync[i]:
-                    next_resync[i] = now + resync_s
-                    if f.last and now - f.last < STALL_SECS:     # only if it's currently healthy
-                        f.restart(planned=True)
+            watchdog_tick(feeds, next_resync, resync_s, now)
 
             # ---- paint tiles: only those whose picture, grey state, label, position or ----
             # ---- selection changed since the last paint                                  ----
@@ -1253,18 +1743,10 @@ def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=Fal
             except (BrokenPipeError, OSError):
                 break
 
-            if any(f.save_needed for f in feeds):
-                for f in feeds:
-                    f.save_needed = False
-                if cfg_by_ip:
-                    save(cfg)
-                    log("saved the new stream settings to cameras.json")
-
+            save_if_needed(feeds, cfg, cfg_by_ip)
             if now - last_status > 600:                          # health summary every 10 min
                 last_status = now
-                log("status: " + "; ".join(
-                    f"{f.name} {'LIVE' if f.last and now - f.last < STALL_SECS else 'DOWN'} "
-                    f"(drops {f.drops})" for f in feeds))
+                log_status(feeds, now)
 
             nxt += interval
             delay = nxt - time.time()
@@ -1276,6 +1758,8 @@ def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=Fal
         stop.set()
         for f in feeds:
             stop_ffmpeg(f.proc)
+        if web_view:
+            web_view.close()
         try:
             mpv.stdin.close()
         except OSError:
@@ -1287,7 +1771,8 @@ def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=Fal
 
 
 def play(args, password, cams=None):
-    need("mpv")
+    if args.command != "serve":
+        need("mpv")
     cfg = load_saved()
     if cams is None:
         cams = cfg.get("cameras", [])
@@ -1324,11 +1809,64 @@ def play(args, password, cams=None):
     if args.verbose:
         COMMON[:] = [o for o in COMMON if o != "--really-quiet"] + ["--msg-level=all=warn"]
     path = SUB if args.sub else MAIN
-    if args.windows:
+    rec = None
+    if args.record:
+        need("ffmpeg")
+        rec = {"dir": args.record, "keep": args.keep, "segment": max(1, args.segment) * 60}
+        check_rec_dir(rec)
+    web = None
+    if args.web is not None:
+        web = {"port": args.web, "bind": args.web_bind}
+    if args.command == "serve":
+        if not rec and not web:
+            web = {"port": WEB_PORT, "bind": args.web_bind}   # serve alone = browser view
+        run_headless(cams, user, password, path, rec, web,
+                     resync_min=args.resync if args.resync is not None else 0)
+    elif args.windows:
+        if rec or web:
+            die("--record / --web work with the grid or 'serve', not --windows")
         play_windows(cams, user, password, path)
     else:
-        play_mosaic(cams, user, password, path, fps=args.fps, resync_min=args.resync,
-                    gpu_scale=args.gpu)
+        play_mosaic(cams, user, password, path, fps=args.fps,
+                    resync_min=args.resync if args.resync is not None else 10,
+                    gpu_scale=args.gpu, rec=rec, web=web)
+
+
+# --------------------------------------------------------------------------- Home Assistant
+def export_ha(args):
+    """Print what to type into Home Assistant for each camera (no login needed)."""
+    cfg = load_saved()
+    cams = cfg.get("cameras", [])
+    if not cams:
+        die(f"no saved cameras — run:  {RUN} --scan")
+    cams = match_cams(cams, args.cam) if args.cam else [c for c in cams if c.get("enabled", True)]
+    if args.exclude:
+        gone = match_cams(cams, args.exclude)
+        cams = [c for c in cams if c not in gone]
+    user = quote(cfg.get("user") or "USERNAME", safe="")
+    host = local_ip() or "THIS-PC-IP"
+    port = args.web or WEB_PORT
+    ids = cam_ids(cams)
+    print("Home Assistant setup, one camera at a time.\n")
+    print("OPTION A — straight from the camera (no need to keep this script running):")
+    print("  Settings > Devices & services > Add integration > Generic Camera, then fill in:")
+    print("    Stream source URL : (below; replace PASSWORD with your RTSP password)")
+    print("    Still image URL   : leave empty")
+    print("    RTSP transport    : TCP")
+    print("    Verify SSL        : OFF  (Wyze cams use a self-signed certificate)\n")
+    for c in cams:
+        path = c.get("stream") or MAIN
+        print(f"  {c['name']:<20} rtsps://{user}:PASSWORD@{c['ip']}:{c.get('port', DEFAULT_PORT)}/{path}")
+    print("\n  Tip: each viewer is one more camera session. If a camera starts refusing")
+    print("  connections, use OPTION B for it instead.\n")
+    print(f"OPTION B — through this script's browser view ({RUN} serve, or --web):")
+    print("  Uses the script's existing camera session, so it adds no load on the camera.")
+    print("  Settings > Devices & services > Add integration > MJPEG IP Camera, then fill in:")
+    print("    Username / Password : your RTSP username and password\n")
+    for i, c in zip(ids, cams):
+        print(f"  {c['name']:<20} MJPEG URL:      http://{host}:{port}/cam/{i}.mjpg")
+        print(f"  {'':<20} Still image URL: http://{host}:{port}/cam/{i}.jpg")
+    print(f"\n  ({host} is this computer's address; use its fixed/reserved IP if it has one.)")
 
 
 # --------------------------------------------------------------------------- test
@@ -1548,8 +2086,11 @@ def main():
         prog="wyzecam-rtsp.py", description="View your Wyze RTSP cameras in one live grid.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:" + __doc__.split("QUICK START")[1].split("OTHER COMMANDS")[0].rstrip())
-    ap.add_argument("command", nargs="?", choices=["play", "scan", "name", "arrange", "test", "all"],
-                    default="play", help="play (default) | scan | name | arrange | test (all = scan then play)")
+    ap.add_argument("command", nargs="?",
+                    choices=["play", "scan", "name", "arrange", "test", "serve", "ha", "all"],
+                    default="play", help="play (default) | scan | name | arrange | test | "
+                                         "serve (no window: --record/--web) | ha (Home Assistant "
+                                         "setup) (all = scan then play)")
     ap.add_argument("target", nargs="?", help="camera for 'test'/'name': name, IP, or last number of the IP")
     ap.add_argument("-c", "--cam", metavar="LIST",
                     help="only these cameras: comma-separated names, IPs, or last IP numbers")
@@ -1558,9 +2099,21 @@ def main():
     ap.add_argument("--list", action="store_true", help="list saved cameras and exit")
     ap.add_argument("--working-only", action="store_true",
                     help="skip cameras whose last scan check failed (default: try them all)")
-    ap.add_argument("--resync", type=int, default=10, metavar="MIN",
+    ap.add_argument("--resync", type=int, default=None, metavar="MIN",
                     help="reconnect each camera every MIN minutes (staggered) to stay live; 0 = off "
-                         "(default 10)")
+                         "(default 10 in the grid, off for 'serve')")
+    ap.add_argument("--record", metavar="DIR",
+                    help="also record every camera into DIR (e.g. a mounted NAS share), "
+                         "one folder per camera")
+    ap.add_argument("--keep", type=int, default=REC_KEEP_DAYS, metavar="DAYS",
+                    help=f"delete recordings older than DAYS (default {REC_KEEP_DAYS}, 0 = keep forever)")
+    ap.add_argument("--segment", type=int, default=REC_SEGMENT_MIN, metavar="MIN",
+                    help=f"length of each recording file in minutes (default {REC_SEGMENT_MIN})")
+    ap.add_argument("--web", type=int, nargs="?", const=WEB_PORT, metavar="PORT",
+                    help=f"also serve the browser view on PORT (default {WEB_PORT})")
+    ap.add_argument("--web-bind", default="0.0.0.0", metavar="ADDR",
+                    help="address for the browser view (default 0.0.0.0 = your whole LAN; "
+                         "127.0.0.1 = this computer only)")
     ap.add_argument("--sub", action="store_true", help="use the lighter substream for every camera")
     ap.add_argument("--fps", type=int, default=15, choices=[10, 15, 20], help="grid frame rate (default 15)")
     ap.add_argument("--windows", action="store_true", help="one window per camera instead of one grid")
@@ -1580,6 +2133,9 @@ def main():
         return
     if args.command == "arrange":       # needs no login
         arrange_cameras(args)
+        return
+    if args.command == "ha":            # needs no login
+        export_ha(args)
         return
 
     args.user = os.environ.get("WYZE_RTSP_USER")

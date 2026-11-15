@@ -2,9 +2,13 @@
 
 View your Wyze cameras' built-in RTSP streams in one live grid on **Linux, macOS or Windows**:
 no Wyze app and no cloud. It scans your network, finds the cameras, and shows them tiled in a
-single window with names, auto-reconnect, and live rearranging.
+single window with names, auto-reconnect, and live rearranging. It can also **record every
+camera to a NAS**, show them in **any web browser**, and hand them to **Home Assistant**, all from
+one connection per camera.
 
 ![Nine estate cameras live in one window](screenshots/hero.jpg)
+
+**Project page:** <https://crash101g.github.io/wyzecam-rtsp/> · License: [GPL-3.0](LICENSE)
 
 > **Important:** this only works with cameras that provide an RTSP stream, and it has only been
 > tested with Wyze Cams. Other RTSP cameras may need a different port or stream path.
@@ -62,6 +66,11 @@ On Windows, use `py wyzecam-rtsp.py` wherever this says `./wyzecam-rtsp.py`.
 ./wyzecam-rtsp.py arrange         # set the saved order / which cameras show
 ./wyzecam-rtsp.py --list          # list saved cameras
 ./wyzecam-rtsp.py --help          # every option
+
+./wyzecam-rtsp.py --record /mnt/nas/cams        # grid + record every camera to a NAS
+./wyzecam-rtsp.py --web                         # grid + browser view on port 8080
+./wyzecam-rtsp.py serve --web --record /mnt/nas/cams   # no window (server / container)
+./wyzecam-rtsp.py ha                            # Home Assistant setup for each camera
 ```
 
 **Keys in the grid** (click the window first):
@@ -76,6 +85,69 @@ On Windows, use `py wyzecam-rtsp.py` wherever this says `./wyzecam-rtsp.py`.
 | z | zoom selected | s | save the layout |
 
 A **dark grey tile** means that camera has no live video right now. It keeps retrying on its own.
+
+## Record to a NAS (`--record`)
+
+```
+./wyzecam-rtsp.py --record /mnt/nas/cams                 # while watching the grid
+./wyzecam-rtsp.py serve --record /mnt/nas/cams           # no window
+./wyzecam-rtsp.py serve --record /mnt/nas/cams --keep 14 --segment 10
+```
+
+- Each camera gets its own folder: `/mnt/nas/cams/Front Door/Front Door_2026-11-15_14-05-00.mkv`.
+- Files are cut on the clock (every 5 minutes by default, `--segment MIN`), so it's easy to find
+  a time. Recordings older than 7 days are deleted (`--keep DAYS`, `0` = keep forever). Only
+  files this tool made are ever deleted.
+- The video is **copied as-is**, not re-encoded, so recording barely uses any CPU. Audio is
+  converted to AAC. Files are `.mkv`, which stay playable even if the power goes out mid-file
+  (open them in VLC or mpv).
+- Recording uses the **same camera session** as the grid or browser view, so it doesn't add load on
+  the camera. Hidden cameras keep recording.
+- Point `--record` at any folder: a mounted NAS share (Linux: mount it with `cifs`/`nfs` first;
+  macOS: `/Volumes/cams`; Windows: `\\nas\cams` works directly). The tool checks it can write
+  there before it starts.
+- Expect a gap of a few seconds whenever a camera reconnects (Wi-Fi drop, or the grid's
+  10-minute resync). For gap-free recording, run `serve`, which doesn't resync by default.
+- A camera whose main stream keeps dropping switches to its substream (lower resolution), and
+  so do its recordings.
+
+## Browser view (`--web`)
+
+```
+./wyzecam-rtsp.py --web                  # alongside the grid, on port 8080
+./wyzecam-rtsp.py serve                  # no window, browser view only
+./wyzecam-rtsp.py serve --web 8090 --record /mnt/nas/cams
+```
+
+Open `http://<this computer's IP>:8080/` on any phone, tablet, PC or TV browser and log in with
+your **RTSP username and password**. You get a live grid with names. Click a camera to zoom, and
+press **f** for fullscreen or **n** to toggle names. A grey tile means that camera has no live
+video right now.
+
+- It's served from each camera's existing session, so ten people watching still add **no load on
+  the cameras**.
+- Each camera also has an **MJPEG stream** at `/cam/<id>.mjpg` and a **snapshot** at
+  `/cam/<id>.jpg`. `<id>` is the last number of the camera's IP, e.g. `/cam/243.mjpg`. Those work
+  in Home Assistant, VLC and mpv.
+- It's plain HTTP with a password, meant for your home network. Don't forward the port to the
+  internet. Use `--web-bind 127.0.0.1` to allow only this computer.
+- Decoding every camera for the browser costs CPU. On a small server, add `--sub` (substreams).
+- Windows: allow Python on **Private networks** if the firewall asks.
+
+## Home Assistant (`ha`)
+
+```
+./wyzecam-rtsp.py ha
+```
+
+This prints what to type into Home Assistant for each camera. No login is needed, and your
+password is never printed. There are two ways to add a camera:
+
+- **Generic Camera, straight from the camera:** use the `rtsps://` stream URL, set RTSP transport
+  to TCP, and turn **Verify SSL off**, because Wyze cams use a self-signed certificate. This works
+  without this tool running, but every Home Assistant viewer is one more camera session.
+- **MJPEG IP Camera, through this tool's browser view:** run `serve` (or `--web`) on an
+  always-on machine. Home Assistant then shares the tool's single session per camera.
 
 ## How it behaves
 
@@ -142,3 +214,7 @@ If anything fails, run it again with `--verbose` and keep the terminal output an
 | A tile keeps going grey | Weak Wi-Fi at that camera: try `--sub`, or move an access point closer |
 | "camera refused the connection" | Too many viewers on that camera (Wyze app, other players). Close them, wait a minute |
 | Everything stutters | Use `--sub`, or `--fps 10` |
+| "can't write to the recording folder" | NAS share not mounted, or mounted read-only / as another user |
+| Recordings play too fast or too slow | Please open an issue with `wyzecam-rtsp-ffmpeg.log`: the recordings use the time each frame arrived as its timestamp, because Wyze streams don't carry usable ones |
+| Browser view keeps asking for a login | Use the RTSP username/password, not your Wyze account |
+| Browser view says the port is in use | Pick another: `--web 8081` |
