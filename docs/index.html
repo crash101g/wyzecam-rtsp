@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>wyzecam-rtsp — every Wyze cam, one screen, no cloud</title>
-<meta name="description" content="Watch, record and share your Wyze cameras' RTSP streams on Linux, macOS and Windows. Live grid, NAS recording, browser view and Home Assistant — one connection per camera, no subscription.">
+<title>wyzecam-rtsp — every Wyze cam, one screen, local AI, no cloud</title>
+<meta name="description" content="Watch, record and share your Wyze cameras' RTSP streams on Linux, macOS and Windows. Live grid, NAS recording, browser view, local AI detection of people and pets, and Home Assistant — one connection per camera, no subscription.">
 <meta property="og:title" content="wyzecam-rtsp — every Wyze cam, one screen, no cloud">
 <meta property="og:description" content="Live grid, NAS recording, browser view and Home Assistant for your Wyze cams. Free and open source.">
 <meta property="og:image" content="screenshots/hero.jpg">
@@ -147,12 +147,13 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
 </div></nav>
 
 <header class="hero"><div class="wrap">
-  <span class="tag">● Live · Local · Free</span>
+  <span class="tag">● Live · Local · AI · Free</span>
   <h1>Every Wyze cam.<br><span class="grad">One screen. No cloud.</span></h1>
-  <p class="lede">wyzecam-rtsp finds your Wyze cameras on your network, shows them all in one live grid, records them to your NAS, streams them to any browser and plugs them into Home Assistant. It's one Python file with no subscription and no Wyze app, and it runs on Linux, macOS and Windows.</p>
+  <p class="lede">wyzecam-rtsp finds your Wyze cameras on your network, shows them all in one live grid, records them to your PC or NAS, spots people and pets with AI that runs on your own computer, streams them to any browser and plugs them into Home Assistant. It's one Python file with no subscription and no Wyze app, and it runs on Linux, macOS and Windows.</p>
   <div class="cta">
     <a class="btn primary" href="https://github.com/crash101g/wyzecam-rtsp">Get it on GitHub →</a>
     <a class="btn ghost" href="#new">See what's new</a>
+    <a class="btn ghost" href="#ai">🧠 Local AI detection</a>
   </div>
   <div class="shot"><img src="screenshots/hero.jpg" alt="Nine cameras live in one grid window" width="1600" height="986"></div>
   <p class="cap">Nine cameras live in one window. (Illustrated mockup: the scenes are drawings, but the layout matches the app.)</p>
@@ -160,7 +161,7 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
   <div class="stats">
     <div class="stat"><b>1</b><span>connection per camera, whatever you're doing with it</span></div>
     <div class="stat"><b>$0</b><span>no subscription, no account, no cloud relay</span></div>
-    <div class="stat"><b>3</b><span>operating systems: Linux, macOS and Windows</span></div>
+    <div class="stat"><b>0</b><span>frames sent to the cloud: the AI runs on your own computer</span></div>
     <div class="stat"><b>1</b><span>Python file, with nothing to pip install</span></div>
   </div>
 </div></header>
@@ -177,6 +178,7 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
     <div class="card"><span class="new">NEW</span><div class="ic">💾</div><h3>Records to your NAS</h3><p>Saves clock-aligned files in one folder per camera, deletes old ones automatically, and barely uses any CPU.</p></div>
     <div class="card"><span class="new">NEW</span><div class="ic">🌐</div><h3>Browser view</h3><p>Watch every camera from any phone, laptop or TV browser on your home network, behind a password.</p></div>
     <div class="card"><span class="new">NEW</span><div class="ic">🏠</div><h3>Home Assistant</h3><p>One command prints exactly what to type into Home Assistant for each camera.</p></div>
+    <div class="card"><span class="new">NEW</span><div class="ic">🧠</div><h3>Local AI detection</h3><p>Spots people, pets and cars on your own computer. Boxes on the tiles, a snapshot per visit, and alerts to Home Assistant.</p></div>
     <div class="card"><span class="new">NEW</span><div class="ic">🖥️</div><h3>Server mode</h3><p><code>serve</code> runs with no window: recording and the browser view on a NAS, Pi, mini-PC or container.</p></div>
   </div>
 
@@ -203,7 +205,7 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
 <section id="new" style="background:var(--bg2);border-top:1px solid var(--line);border-bottom:1px solid var(--line)"><div class="wrap">
   <div class="kicker">// new in this release</div>
   <h2>Watch it. Record it. <span style="color:var(--acc)">Share it.</span></h2>
-  <p class="sub">The three most-requested Wyze features are a browser view, NAS recording and Home Assistant. They all run from the connection the grid already has open, so the cameras don't get any extra load.</p>
+  <p class="sub">The most-requested Wyze features are a browser view, NAS recording, Home Assistant and person detection without a subscription. They all run from the connection the grid already has open, so the cameras don't get any extra load.</p>
 
   <div class="flow">
     <div class="node"><b>📷 Wyze cam</b><small>built-in RTSPS</small></div>
@@ -258,6 +260,25 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
   </div>
   <div class="feature">
     <div class="txt">
+      <div class="kicker" id="ai">// local ai detection</div>
+      <h3>It knows a person from a pet from a car.</h3>
+      <p>Add <code>--detect</code> and a small AI model runs <b>on your own computer</b>, with no cloud and no subscription. Each person, dog or cat gets a box on its camera's tile, a snapshot, and a line in the events log.</p>
+      <ul><li>Checks only when something moves, so 6 cameras stay light</li><li>One event per visit, not hundreds: objects are tracked</li><li>Events panel in the browser view: press <b>e</b></li><li><code>--detect-webhook</code> sends each detection to Home Assistant</li><li>Bring your own model, for example one trained on packages</li></ul>
+      <code class="cmd">./wyzecam-rtsp.py serve --web --detect</code>
+    </div>
+    <div><div class="shot"><img src="screenshots/detect-web.jpg" alt="Browser view with detection boxes and the events panel" loading="lazy"></div><p class="cap">Real capture: test cameras playing a YOLOX sample photo (Apache-2.0)</p></div>
+  </div>
+  <div class="feature flip">
+    <div class="txt">
+      <div class="kicker">// in the grid too</div>
+      <h3>Boxes right on the live grid.</h3>
+      <p>The grid window draws each object in its type's colour (red for people, green for pets, blue for vehicles), and every new visit saves a labelled snapshot like this one:</p>
+      <img src="screenshots/detect-snapshot.jpg" alt="Saved event snapshot with labelled boxes" loading="lazy" style="border-radius:10px;border:1px solid var(--line);margin-top:6px">
+    </div>
+    <div><div class="shot"><img src="screenshots/detect-grid.jpg" alt="Grid window with detection boxes" loading="lazy"></div><p class="cap">Real capture of the grid output (two test cameras)</p></div>
+  </div>
+  <div class="feature">
+    <div class="txt">
       <div class="kicker">// proof</div>
       <h3>Not just a mockup: here it is running.</h3>
       <p>This is an unedited capture of the real browser view, serving four simulated cameras with test-pattern video. The login, live updates and per-camera status dots are all working.</p>
@@ -295,6 +316,7 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
         <li>Recording folder checked before start; camera names made safe for folders</li>
         <li><code>serve</code> with no window, reconnects included</li>
         <li><code>ha</code> output, including on Windows</li>
+        <li>AI detection: people, dogs, cars and bicycles found in test footage; boxes in the grid and browser view; snapshots; events log; webhook; old events deleted</li>
       </ul>
     </div>
     <div class="col chk">
@@ -308,6 +330,9 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
         <li>CPU load of the browser view with many main streams</li>
         <li>A NAS share dropping mid-recording</li>
         <li>First run on a real Mac and a real Windows PC</li>
+        <li>Detection accuracy on real Wyze footage: night vision, rain, small or distant people</li>
+        <li>Detection CPU load on your PC with all cameras on</li>
+        <li>Bring-your-own YOLOv8/v9-style models (e.g. for packages)</li>
       </ul>
     </div>
   </div>
@@ -327,20 +352,26 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
 <span class="c"># 3. go further</span>
 <span class="p">$</span> ./wyzecam-rtsp.py --web --record /mnt/nas/cams     <span class="c"># grid + browser + recording</span>
 <span class="p">$</span> ./wyzecam-rtsp.py serve --web --record /mnt/nas/cams <span class="c"># same, no window</span>
-<span class="p">$</span> ./wyzecam-rtsp.py ha                               <span class="c"># Home Assistant setup</span></pre>
+<span class="p">$</span> ./wyzecam-rtsp.py ha                               <span class="c"># Home Assistant setup</span>
+
+<span class="c"># 4. local AI detection of people and pets (one-time install)</span>
+<span class="p">$</span> python3 -m pip install onnxruntime numpy
+<span class="p">$</span> ./wyzecam-rtsp.py serve --web --detect</pre>
   </div>
 
   <div class="faq">
     <div><h4>Does my video go to the cloud?</h4><p>No. Video goes straight from each camera to your computer over your home network, and the tool needs no internet connection.</p></div>
     <div><h4>Can I still use the Wyze app?</h4><p>Yes. Alerts, event clips and settings keep working. On weak Wi-Fi, opening live view on your phone may briefly drop that camera's tile, and the grid reconnects it.</p></div>
     <div><h4>Which cameras work?</h4><p>Wyze cameras whose firmware offers RTSP: tested on Cam v3, Cam Pan v3 and Cam v4 (RTSP firmware). Other RTSP cameras may need a different port or path.</p></div>
+    <div><h4>Does the AI detection need the cloud or a subscription?</h4><p>No. The model runs on your own computer, so no video or snapshots leave your network. It's a one-time <code>pip install onnxruntime numpy</code>, and the model downloads once from the YOLOX project on GitHub.</p></div>
+    <div><h4>Can it detect packages?</h4><p>Not with the default model: the standard COCO training data has no "package" label. You can load your own package-trained ONNX model with <code>--detect-model</code>.</p></div>
     <div><h4>Is the browser view safe to expose?</h4><p>It's plain HTTP behind your RTSP password, made for your home network. Don't forward it to the internet; use <code>--web-bind 127.0.0.1</code> to allow only this computer.</p></div>
   </div>
 </div></section>
 
 <div class="final"><div class="wrap">
   <h2>Your cameras, on your terms.</h2>
-  <p class="sub" style="margin:0 auto">Free, open source and in one file. Star it, try it, and open an issue saying how it ran on your cameras.</p>
+  <p class="sub" style="margin:0 auto">Live grid, recording, browser view and local AI. Free, open source and in one file. Star it, try it, and open an issue saying how it ran on your cameras.</p>
   <div class="cta"><a class="btn primary" href="https://github.com/crash101g/wyzecam-rtsp">★ Star on GitHub</a><a class="btn ghost" href="https://github.com/crash101g/wyzecam-rtsp/issues">Report how it went</a></div>
 </div></div>
 
