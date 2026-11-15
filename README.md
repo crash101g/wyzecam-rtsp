@@ -92,6 +92,7 @@ A **dark grey tile** means that camera has no live video right now. It keeps ret
 ./wyzecam-rtsp.py --record /mnt/nas/cams                 # while watching the grid
 ./wyzecam-rtsp.py serve --record /mnt/nas/cams           # no window
 ./wyzecam-rtsp.py serve --record /mnt/nas/cams --keep 14 --segment 10
+./wyzecam-rtsp.py serve --record /mnt/nas/cams --rec-format mp4   # phone/browser-friendly files
 ```
 
 - Each camera gets its own folder: `/mnt/nas/cams/Front Door/Front Door_2026-11-15_14-05-00.mkv`.
@@ -99,8 +100,12 @@ A **dark grey tile** means that camera has no live video right now. It keeps ret
   a time. Recordings older than 7 days are deleted (`--keep DAYS`, `0` = keep forever). Only
   files this tool made are ever deleted.
 - The video is **copied as-is**, not re-encoded, so recording barely uses any CPU. Audio is
-  converted to AAC. Files are `.mkv`, which stay playable even if the power goes out mid-file
-  (open them in VLC or mpv).
+  converted to AAC.
+- **File type** (`--rec-format`):
+  - `mkv` (default): stays playable even if the power goes out mid-file. Open it in VLC or mpv.
+  - `mp4`: *fragmented* MP4, which also survives a crash and plays in web browsers, phone photo
+    apps, QuickTime and Home Assistant's media browser. Good for sharing clips. H.265 cameras are
+    tagged so Apple devices can play them.
 - Recording uses the **same camera session** as the grid or browser view, so it doesn't add load on
   the camera. Hidden cameras keep recording.
 - Point `--record` at any folder: a mounted NAS share (Linux: mount it with `cifs`/`nfs` first;

@@ -30,7 +30,8 @@ OTHER COMMANDS
   ./wyzecam-rtsp.py ha                  print Home Assistant setup for each camera
 
 RECORDING AND BROWSER VIEW (grid or 'serve'; each camera still uses ONE camera session)
-  --record DIR       record every camera into DIR/<camera name>/ (.mkv, video copied as-is)
+  --record DIR       record every camera into DIR/<camera name>/ (video copied as-is)
+  --rec-format FMT   mkv (default: survives crashes) or mp4 (fragmented: plays in browsers/phones)
   --keep DAYS        delete recordings older than DAYS (default 7, 0 = keep forever)
   --segment MIN      minutes per recording file (default 5)
   --web [PORT]       browser view at http://this-pc:PORT/ (default 8080), RTSP login required
@@ -111,7 +112,7 @@ MAIN, SUB = "stream0", "stream1"
 VERBOSE = False
 STALL_SECS = 8          # a camera that stops sending frames this long gets reconnected
 FIRST_FRAME_SECS = 25   # allowance for the first frame after (re)connecting
-# Recording (--record): video is copied as-is (no re-encoding) into .mkv files of this length.
+# Recording (--record): video is copied as-is (no re-encoding) into files of this length.
 REC_SEGMENT_MIN = 5
 REC_KEEP_DAYS = 7       # recordings older than this are deleted (--keep, 0 = keep forever)
 # Browser view (--web): JPEG snapshots, at most this wide, of every Nth camera frame.
@@ -607,11 +608,12 @@ def drawtext_escape(t):
 
 
 def camera_ffmpeg_cmd(url, tile_w, tile_h, hwaccel=True, keep_every=2, gpu_scale=False,
-                      tiles=True, rec_pattern=None, rec_segment=300, jpeg_port=None):
+                      tiles=True, rec_pattern=None, rec_segment=300, jpeg_port=None,
+                      rec_format="mkv", hevc=False):
     """One ffmpeg per camera, i.e. ONE camera session, with up to three outputs:
       tiles       decode, keep every Nth frame (counted, since Wyze streams have no usable
                   timestamps), scale to the tile, raw YUV420 frames on stdout (the grid)
-      rec_pattern copy the video as-is (no re-encoding) into clock-aligned .mkv segments
+      rec_pattern copy the video as-is (no re-encoding) into clock-aligned .mkv/.mp4 segments
       jpeg_port   JPEG snapshots for the browser view, sent to a local TCP port
     gpu_scale: decode AND shrink on the GPU (VA-API), copy only the small tile back."""
     gpu = hwaccel and gpu_scale and IS_LINUX and jpeg_port is None   # VA-API (Linux) only
@@ -633,8 +635,17 @@ def camera_ffmpeg_cmd(url, tile_w, tile_h, hwaccel=True, keep_every=2, gpu_scale
     if rec_pattern:
         cmd += ["-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy", "-c:a", "aac", "-b:a", "64k",
                 "-f", "segment", "-segment_time", str(rec_segment), "-segment_atclocktime", "1",
-                "-segment_format", "matroska", "-reset_timestamps", "1", "-strftime", "1",
-                rec_pattern]
+                "-reset_timestamps", "1", "-strftime", "1"]
+        if rec_format == "mp4":
+            # Fragmented MP4: written in small self-contained pieces, so a crash or power cut
+            # loses only the last moment (a plain MP4 is unplayable until it's finished).
+            cmd += ["-segment_format", "mp4", "-segment_format_options",
+                    "movflags=+frag_keyframe+empty_moov+default_base_moof"]
+            if hevc:
+                cmd += ["-tag:v", "hvc1"]          # lets Apple devices play H.265 in MP4
+        else:
+            cmd += ["-segment_format", "matroska"]
+        cmd.append(rec_pattern)
     if jpeg_port:
         cmd += ["-map", "0:v:0", "-an",
                 # fresh, strictly increasing timestamps: the JPEG encoder rejects repeats
@@ -671,11 +682,13 @@ class CameraFeed(threading.Thread):
     can be told to resync (reconnect) to get back to live, and falls back to the
     lighter substream + CPU decoding if the main stream keeps dropping."""
     def __init__(self, cam, user, password, path, tile_w, tile_h, stop, keep_every, cfg_cam=None,
-                 gpu_scale=False, tiles=True, rec_root=None, rec_segment=300, web=False):
+                 gpu_scale=False, tiles=True, rec_root=None, rec_segment=300, web=False,
+                 rec_format="mkv"):
         super().__init__(daemon=True)
         self.tiles = tiles         # False = headless (no grid): no raw frames are decoded for us
         self.rec_root = rec_root   # Path: record into rec_root/<camera name>/
         self.rec_segment = rec_segment
+        self.rec_format = rec_format
         self.web = web             # True = also make JPEG snapshots for the browser view
         self.jpeg = None           # newest JPEG (bytes) and its sequence number
         self.jpeg_seq = 0
@@ -713,7 +726,7 @@ class CameraFeed(threading.Thread):
         except OSError as e:
             log(f"[{self.name}] can't create recording folder {folder}: {e} — not recording")
             return None
-        return str(folder / f"{safe_name(self.name)}_%Y-%m-%d_%H-%M-%S.mkv")
+        return str(folder / f"{safe_name(self.name)}_%Y-%m-%d_%H-%M-%S.{self.rec_format}")
 
     def _jpeg_reader(self, listener):
         """Receive ffmpeg's JPEG stream on a local socket; keep only the newest picture.
@@ -755,18 +768,21 @@ class CameraFeed(threading.Thread):
             conn.close()
 
     def _progress_reader(self, out, first_frame):
-        """Headless: ffmpeg's -progress lines ('frame=123') tell us video is still arriving."""
-        last_n = 0
+        """Headless: ffmpeg's -progress lines tell us video is still arriving. 'frame=' counts
+        only re-encoded video (the browser view's JPEGs); when recording alone, everything is
+        copied and only 'out_time_us=' moves, so either one counts as progress."""
+        last = {"frame": 0, "out_time_us": 0}
         for raw in out:
             line = raw.decode(errors="replace").strip()
-            if line.startswith("frame="):
+            key, _, val = line.partition("=")
+            if key in last:
                 try:
-                    n = int(line[6:])
+                    n = int(val)
                 except ValueError:
                     continue
-                if n > last_n:
-                    self.frames += n - last_n
-                    last_n = n
+                if n > last[key]:
+                    self.frames += (n - last[key]) if key == "frame" else 1
+                    last[key] = n
                     self.last = time.time()
                     if first_frame[0] is None:
                         first_frame[0] = self.last
@@ -829,7 +845,8 @@ class CameraFeed(threading.Thread):
             self.proc = popen_ffmpeg(
                 camera_ffmpeg_cmd(self.url(), self.w, self.h, self.hwaccel, self.keep_every,
                                   self.gpu_scale, tiles=self.tiles, rec_pattern=self.rec_pattern(),
-                                  rec_segment=self.rec_segment,
+                                  rec_segment=self.rec_segment, rec_format=self.rec_format,
+                                  hevc=str(self.cam.get("video", "")).lower().startswith(("hevc", "h265")),
                                   jpeg_port=listener.getsockname()[1] if listener else None),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             et = threading.Thread(target=self._stderr_reader, args=(self.proc.stderr, errlines), daemon=True)
@@ -1144,7 +1161,7 @@ def check_rec_dir(rec):
 
 class Pruner(threading.Thread):
     """Deletes recordings older than `keep_days` (checked at start, then every 30 minutes).
-    Only touches .mkv files this tool made, one folder down from the recording folder."""
+    Only touches .mkv/.mp4 files this tool made, one folder down from the recording folder."""
     def __init__(self, root, keep_days, stop):
         super().__init__(daemon=True)
         self.root, self.keep, self.stop = Path(root), keep_days, stop
@@ -1153,7 +1170,8 @@ class Pruner(threading.Thread):
         while not self.stop.is_set():
             cutoff = time.time() - self.keep * 86400
             removed = 0
-            for f in self.root.glob("*/*_????-??-??_??-??-??.mkv"):
+            for f in [*self.root.glob("*/*_????-??-??_??-??-??.mkv"),
+                      *self.root.glob("*/*_????-??-??_??-??-??.mp4")]:
                 try:
                     if f.stat().st_mtime < cutoff:
                         f.unlink()
@@ -1356,7 +1374,7 @@ def start_extras(feeds, rec, web, user, password, stop):
 
 def print_extras(rec, web_view, n):
     if rec:
-        print(f" Recording {n} camera(s) to {rec['dir']}  ({rec['segment'] // 60}-min files, "
+        print(f" Recording {n} camera(s) to {rec['dir']}  ({rec['segment'] // 60}-min .{rec['format']} files, "
               f"{'kept %s days' % rec['keep'] if rec['keep'] > 0 else 'kept forever'})")
     if web_view:
         print(f" Browser view: {web_view.urls()}  (log in with your RTSP username/password)")
@@ -1371,7 +1389,8 @@ def run_headless(cams, user, password, path, rec=None, web=None, resync_min=0):
     cfg_by_ip = {c["ip"]: c for c in cfg.get("cameras", [])}
     feeds = [CameraFeed(c, user, password, path, 0, 0, stop, 1, cfg_by_ip.get(c["ip"]),
                         tiles=False, rec_root=rec and rec["dir"],
-                        rec_segment=rec["segment"] if rec else 300, web=bool(web)) for c in cams]
+                        rec_segment=rec["segment"] if rec else 300, web=bool(web),
+                        rec_format=rec["format"] if rec else "mkv") for c in cams]
     web_view = start_extras(feeds, rec, web, user, password, stop)
     for f in feeds:
         f.start()
@@ -1438,7 +1457,8 @@ def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=Fal
     cfg_by_ip = {c["ip"]: c for c in cfg.get("cameras", [])}
     feeds = [CameraFeed(c, user, password, path, tw, th, stop, keep_every, cfg_by_ip.get(c["ip"]),
                         gpu_scale, rec_root=rec and rec["dir"],
-                        rec_segment=rec["segment"] if rec else 300, web=bool(web)) for c in cams]
+                        rec_segment=rec["segment"] if rec else 300, web=bool(web),
+                        rec_format=rec["format"] if rec else "mkv") for c in cams]
     web_view = start_extras(feeds, rec, web, user, password, stop)
     for f in feeds:
         f.start()
@@ -1812,7 +1832,8 @@ def play(args, password, cams=None):
     rec = None
     if args.record:
         need("ffmpeg")
-        rec = {"dir": args.record, "keep": args.keep, "segment": max(1, args.segment) * 60}
+        rec = {"dir": args.record, "keep": args.keep, "segment": max(1, args.segment) * 60,
+               "format": args.rec_format}
         check_rec_dir(rec)
     web = None
     if args.web is not None:
@@ -2109,6 +2130,9 @@ def main():
                     help=f"delete recordings older than DAYS (default {REC_KEEP_DAYS}, 0 = keep forever)")
     ap.add_argument("--segment", type=int, default=REC_SEGMENT_MIN, metavar="MIN",
                     help=f"length of each recording file in minutes (default {REC_SEGMENT_MIN})")
+    ap.add_argument("--rec-format", choices=["mkv", "mp4"], default="mkv",
+                    help="recording file type: mkv (default; survives crashes, plays in VLC/mpv) or "
+                         "mp4 (fragmented; also plays in browsers, phones and Home Assistant)")
     ap.add_argument("--web", type=int, nargs="?", const=WEB_PORT, metavar="PORT",
                     help=f"also serve the browser view on PORT (default {WEB_PORT})")
     ap.add_argument("--web-bind", default="0.0.0.0", metavar="ADDR",
