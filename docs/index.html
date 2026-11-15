@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>wyzecam-rtsp — every Wyze cam, one screen, no cloud</title>
+<meta name="description" content="Watch, record and share your Wyze cameras' RTSP streams on Linux, macOS and Windows. Live grid, NAS recording, browser view and Home Assistant — one connection per camera, no subscription.">
+<meta property="og:title" content="wyzecam-rtsp — every Wyze cam, one screen, no cloud">
+<meta property="og:description" content="Live grid, NAS recording, browser view and Home Assistant for your Wyze cams. Free and open source.">
+<meta property="og:image" content="screenshots/hero.jpg">
+<style>
+:root{
+  --bg:#07090f; --bg2:#0c1019; --panel:#111725; --line:#1d2536; --text:#e8ecf4; --mute:#8d97ab;
+  --acc:#b6ff3c; --acc2:#3cf0ff; --rec:#ff3b4f; --warn:#ffc53d;
+  --mono:ui-monospace,"JetBrains Mono","DejaVu Sans Mono",Menlo,Consolas,monospace;
+  --sans:Inter,"Segoe UI",system-ui,-apple-system,Roboto,"Noto Sans",sans-serif;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--text);font:17px/1.6 var(--sans);-webkit-font-smoothing:antialiased}
+a{color:var(--acc2);text-decoration:none}
+a:hover{text-decoration:underline}
+img{max-width:100%;display:block}
+.wrap{max-width:1180px;margin:0 auto;padding:0 24px}
+code,pre{font-family:var(--mono)}
+
+/* ---------- nav ---------- */
+nav{position:sticky;top:0;z-index:20;background:rgba(7,9,15,.78);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+nav .wrap{display:flex;align-items:center;justify-content:space-between;height:60px}
+.logo{font:700 18px var(--mono);color:var(--text);display:flex;align-items:center;gap:10px}
+.logo i{width:10px;height:10px;border-radius:50%;background:var(--rec);box-shadow:0 0 12px var(--rec);animation:blink 1.6s infinite}
+@keyframes blink{50%{opacity:.25}}
+nav .links{display:flex;gap:26px;font-size:15px}
+nav .links a{color:var(--mute)}
+nav .links a:hover{color:var(--text);text-decoration:none}
+@media(max-width:760px){nav .links a:not(.gh){display:none}}
+
+/* ---------- hero ---------- */
+.hero{position:relative;overflow:hidden;padding:90px 0 40px;
+  background:
+    radial-gradient(900px 500px at 15% -10%,rgba(60,240,255,.16),transparent 60%),
+    radial-gradient(800px 500px at 95% 10%,rgba(182,255,60,.12),transparent 60%),
+    linear-gradient(var(--bg),var(--bg2))}
+.hero:before{content:"";position:absolute;inset:0;pointer-events:none;opacity:.35;
+  background:repeating-linear-gradient(0deg,rgba(255,255,255,.035) 0 1px,transparent 1px 4px)}
+.tag{display:inline-flex;align-items:center;gap:10px;font:600 13px var(--mono);letter-spacing:.08em;
+  text-transform:uppercase;color:var(--acc);border:1px solid rgba(182,255,60,.35);background:rgba(182,255,60,.07);
+  padding:6px 14px;border-radius:999px}
+h1{font-size:clamp(44px,7.4vw,92px);line-height:.98;letter-spacing:-.035em;margin:22px 0 20px;font-weight:850}
+h1 .grad{background:linear-gradient(90deg,var(--acc),var(--acc2));-webkit-background-clip:text;background-clip:text;color:transparent}
+.lede{font-size:clamp(18px,2.1vw,22px);color:#c4ccdb;max-width:760px;margin:0 0 34px}
+.cta{display:flex;flex-wrap:wrap;gap:14px;margin-bottom:56px}
+.btn{display:inline-flex;align-items:center;gap:10px;padding:14px 24px;border-radius:12px;font-weight:700;font-size:16px;transition:transform .15s,box-shadow .15s}
+.btn:hover{text-decoration:none;transform:translateY(-2px)}
+.btn.primary{background:var(--acc);color:#0b0f05;box-shadow:0 10px 30px rgba(182,255,60,.25)}
+.btn.ghost{border:1px solid var(--line);color:var(--text);background:rgba(255,255,255,.03)}
+.shot{border-radius:16px;overflow:hidden;border:1px solid var(--line);box-shadow:0 40px 120px rgba(0,0,0,.6),0 0 0 1px rgba(255,255,255,.03)}
+.hero .shot{transform:perspective(1800px) rotateX(6deg);transform-origin:top center}
+.cap{font-size:13px;color:var(--mute);margin-top:12px;text-align:center}
+
+/* ---------- stats ---------- */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:16px;overflow:hidden;margin:70px 0 0;background:var(--panel)}
+.stat{padding:26px 22px;border-right:1px solid var(--line)}
+.stat:last-child{border-right:0}
+.stat b{display:block;font:800 40px/1 var(--sans);letter-spacing:-.03em;color:var(--acc)}
+.stat span{color:var(--mute);font-size:15px}
+@media(max-width:760px){.stats{grid-template-columns:1fr 1fr}.stat:nth-child(2){border-right:0}.stat:nth-child(-n+2){border-bottom:1px solid var(--line)}}
+
+/* ---------- sections ---------- */
+section{padding:100px 0}
+.kicker{font:600 13px var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--acc2)}
+h2{font-size:clamp(32px,4.4vw,54px);line-height:1.04;letter-spacing:-.03em;margin:12px 0 18px;font-weight:820}
+.sub{color:#b9c2d3;max-width:720px;font-size:19px;margin:0}
+
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:18px;margin-top:46px}
+.card{background:linear-gradient(180deg,var(--panel),#0d1220);border:1px solid var(--line);border-radius:16px;padding:26px;position:relative}
+.card h3{margin:14px 0 8px;font-size:20px;letter-spacing:-.01em}
+.card p{margin:0;color:var(--mute);font-size:15.5px}
+.card .ic{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;font-size:22px;background:rgba(60,240,255,.08);border:1px solid rgba(60,240,255,.25)}
+.new{position:absolute;top:18px;right:18px;font:700 11px var(--mono);letter-spacing:.1em;color:#0b0f05;background:var(--acc);padding:3px 8px;border-radius:6px}
+
+.feature{display:grid;grid-template-columns:1fr 1.25fr;gap:56px;align-items:center;padding:56px 0;border-top:1px solid var(--line)}
+.feature.flip{grid-template-columns:1.25fr 1fr}
+.feature.flip .txt{order:2}
+.feature h3{font-size:clamp(26px,3vw,36px);letter-spacing:-.02em;line-height:1.1;margin:10px 0 14px}
+.feature p{color:#b9c2d3;margin:0 0 16px}
+.feature ul{margin:0;padding:0;list-style:none}
+.feature li{padding:7px 0 7px 28px;position:relative;color:#cfd6e3}
+.feature li:before{content:"";position:absolute;left:4px;top:15px;width:10px;height:10px;border-radius:3px;background:var(--acc);box-shadow:0 0 10px rgba(182,255,60,.5)}
+.feature>div{min-width:0}
+.cmd{display:block;margin-top:18px;background:#05070b;border:1px solid var(--line);border-radius:10px;padding:12px 16px;font:14px var(--mono);color:var(--acc);overflow-x:auto;white-space:nowrap}
+@media(max-width:900px){.feature,.feature.flip{grid-template-columns:1fr;gap:28px}.feature.flip .txt{order:0}}
+
+/* ---------- one session diagram ---------- */
+.flow{display:grid;grid-template-columns:1fr auto 1.2fr auto 1fr;gap:18px;align-items:center;margin-top:48px}
+.node{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:20px;text-align:center}
+.node b{display:block;font-size:18px}
+.node small{color:var(--mute)}
+.node.core{border-color:rgba(182,255,60,.5);box-shadow:0 0 40px rgba(182,255,60,.12)}
+.outs{display:grid;gap:12px}
+.outs .node{text-align:left;padding:14px 18px}
+.arrow{font:700 28px var(--mono);color:var(--acc)}
+@media(max-width:900px){.flow{grid-template-columns:1fr}.arrow{transform:rotate(90deg);justify-self:center}}
+
+/* ---------- status board ---------- */
+.board{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:46px}
+.col{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:24px}
+.col h3{margin:0 0 4px;font-size:19px;display:flex;align-items:center;gap:10px}
+.col .note{color:var(--mute);font-size:14px;margin:0 0 16px}
+.col ul{list-style:none;margin:0;padding:0}
+.col li{padding:9px 0 9px 30px;border-top:1px solid var(--line);position:relative;font-size:15.5px;color:#d4dae6}
+.col li:before{position:absolute;left:0;top:8px;font:700 15px var(--mono)}
+.ok li:before{content:"✓";color:var(--acc)}
+.sim li:before{content:"◐";color:var(--acc2)}
+.chk li:before{content:"?";color:var(--warn)}
+.dot{width:12px;height:12px;border-radius:50%}
+@media(max-width:980px){.board{grid-template-columns:1fr}}
+
+/* ---------- quick start ---------- */
+.term{background:#05070b;border:1px solid var(--line);border-radius:16px;overflow:hidden;margin-top:40px}
+.term .bar{height:40px;background:#141a26;display:flex;align-items:center;gap:8px;padding:0 16px}
+.term .bar span{width:12px;height:12px;border-radius:50%}
+.term pre{margin:0;padding:24px 26px;font-size:15px;line-height:1.75;overflow-x:auto;color:#d7dce6}
+.term .c{color:#5f6b80}
+.term .p{color:var(--acc)}
+
+.faq{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-top:40px}
+.faq div{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px}
+.faq h4{margin:0 0 8px;font-size:17px}
+.faq p{margin:0;color:var(--mute);font-size:15.5px}
+@media(max-width:800px){.faq{grid-template-columns:1fr}}
+
+.final{text-align:center;padding:110px 0;background:radial-gradient(700px 360px at 50% 0%,rgba(182,255,60,.13),transparent 70%)}
+.final .cta{justify-content:center;margin:30px 0 0}
+footer{border-top:1px solid var(--line);padding:34px 0 50px;color:var(--mute);font-size:14px}
+footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
+</style>
+</head>
+<body>
+
+<nav><div class="wrap">
+  <a class="logo" href="#"><i></i>wyzecam-rtsp</a>
+  <div class="links">
+    <a href="#features">Features</a><a href="#new">What's new</a><a href="#status">Status</a>
+    <a href="#start">Get started</a><a class="gh" href="https://github.com/crash101g/wyzecam-rtsp">GitHub →</a>
+  </div>
+</div></nav>
+
+<header class="hero"><div class="wrap">
+  <span class="tag">● Live · Local · Free</span>
+  <h1>Every Wyze cam.<br><span class="grad">One screen. No cloud.</span></h1>
+  <p class="lede">wyzecam-rtsp finds your Wyze cameras on your network, shows them all in one live grid, records them to your NAS, streams them to any browser and plugs them into Home Assistant. It's one Python file with no subscription and no Wyze app, and it runs on Linux, macOS and Windows.</p>
+  <div class="cta">
+    <a class="btn primary" href="https://github.com/crash101g/wyzecam-rtsp">Get it on GitHub →</a>
+    <a class="btn ghost" href="#new">See what's new</a>
+  </div>
+  <div class="shot"><img src="screenshots/hero.jpg" alt="Nine cameras live in one grid window" width="1600" height="986"></div>
+  <p class="cap">Nine cameras live in one window. (Illustrated mockup: the scenes are drawings, but the layout matches the app.)</p>
+
+  <div class="stats">
+    <div class="stat"><b>1</b><span>connection per camera, whatever you're doing with it</span></div>
+    <div class="stat"><b>$0</b><span>no subscription, no account, no cloud relay</span></div>
+    <div class="stat"><b>3</b><span>operating systems: Linux, macOS and Windows</span></div>
+    <div class="stat"><b>1</b><span>Python file, with nothing to pip install</span></div>
+  </div>
+</div></header>
+
+<section id="features"><div class="wrap">
+  <div class="kicker">// the grid</div>
+  <h2>See all your cameras at once.</h2>
+  <p class="sub">The Wyze app shows one camera at a time on a phone. This puts every camera on your monitor or TV in one window, and keeps them all live.</p>
+  <div class="cards">
+    <div class="card"><div class="ic">📡</div><h3>Finds your cameras</h3><p>Scans your network for cameras with RTSP turned on, names them, and remembers them.</p></div>
+    <div class="card"><div class="ic">🧩</div><h3>Rearrange live</h3><p>Press 1–9 to pick a camera, then use the arrow keys to move it. <b>z</b> zooms, <b>e</b> renames, <b>s</b> saves the layout.</p></div>
+    <div class="card"><div class="ic">🛟</div><h3>Self-healing</h3><p>Each camera has its own reconnect loop, so one flaky Wi-Fi camera never freezes the others. Unstable cameras switch to their substream on their own.</p></div>
+    <div class="card"><div class="ic">⚡</div><h3>Uses your GPU</h3><p>Decodes on the GPU where it can: VA-API on Linux, VideoToolbox on macOS, D3D11 on Windows.</p></div>
+    <div class="card"><span class="new">NEW</span><div class="ic">💾</div><h3>Records to your NAS</h3><p>Saves clock-aligned files in one folder per camera, deletes old ones automatically, and barely uses any CPU.</p></div>
+    <div class="card"><span class="new">NEW</span><div class="ic">🌐</div><h3>Browser view</h3><p>Watch every camera from any phone, laptop or TV browser on your home network, behind a password.</p></div>
+    <div class="card"><span class="new">NEW</span><div class="ic">🏠</div><h3>Home Assistant</h3><p>One command prints exactly what to type into Home Assistant for each camera.</p></div>
+    <div class="card"><span class="new">NEW</span><div class="ic">🖥️</div><h3>Server mode</h3><p><code>serve</code> runs with no window: recording and the browser view on a NAS, Pi, mini-PC or container.</p></div>
+  </div>
+
+  <div class="feature" style="margin-top:60px">
+    <div class="txt">
+      <div class="kicker">// arrange</div>
+      <h3>Your layout, set from the keyboard.</h3>
+      <p>Select a camera, move it with the arrow keys and save. Hide the cameras you don't need, and rename them without leaving the grid.</p>
+      <ul><li>Yellow border shows what's selected</li><li><b>z</b> fills the window with one camera</li><li>Layout saved to <code>cameras.json</code></li></ul>
+    </div>
+    <div><div class="shot"><img src="screenshots/arrange.jpg" alt="Selecting a camera to rearrange" loading="lazy"></div><p class="cap">Illustrated mockup</p></div>
+  </div>
+  <div class="feature flip">
+    <div class="txt">
+      <div class="kicker">// self-healing</div>
+      <h3>One camera drops. The rest keep playing.</h3>
+      <p>A camera without live video turns dark grey and reconnects by itself. Cameras are also refreshed on a staggered schedule, so none of them drifts behind live.</p>
+      <ul><li>Watchdog reconnects stalled cameras</li><li>Unstable main stream? It switches to the substream automatically</li><li>Logs every event, with passwords removed</li></ul>
+    </div>
+    <div><div class="shot"><img src="screenshots/reconnecting.jpg" alt="One camera reconnecting shown as a grey tile" loading="lazy"></div><p class="cap">Illustrated mockup: Tennis Court is reconnecting</p></div>
+  </div>
+</div></section>
+
+<section id="new" style="background:var(--bg2);border-top:1px solid var(--line);border-bottom:1px solid var(--line)"><div class="wrap">
+  <div class="kicker">// new in this release</div>
+  <h2>Watch it. Record it. <span style="color:var(--acc)">Share it.</span></h2>
+  <p class="sub">The three most-requested Wyze features are a browser view, NAS recording and Home Assistant. They all run from the connection the grid already has open, so the cameras don't get any extra load.</p>
+
+  <div class="flow">
+    <div class="node"><b>📷 Wyze cam</b><small>built-in RTSPS</small></div>
+    <div class="arrow">→</div>
+    <div class="node core"><b>1 connection</b><small>one ffmpeg per camera, which reconnects on its own</small></div>
+    <div class="arrow">→</div>
+    <div class="outs">
+      <div class="node"><b>🖼️ Grid window</b><small>mpv</small></div>
+      <div class="node"><b>💾 NAS recording</b><small>.mkv, copied as-is</small></div>
+      <div class="node"><b>🌐 Browser + HA</b><small>JPEG / MJPEG</small></div>
+    </div>
+  </div>
+
+  <div class="feature" style="margin-top:50px">
+    <div class="txt">
+      <div class="kicker">// browser view</div>
+      <h3>Every camera, in any browser.</h3>
+      <p>Open <code>http://your-pc:8080</code> on a laptop, phone or the browser on your TV and log in with your RTSP username and password. You get a live grid: click a camera to zoom, press <b>f</b> for fullscreen.</p>
+      <ul><li>Ten people watching still means one connection per camera</li><li>Phones get one camera per row, so you can scroll</li><li>MJPEG and snapshot URLs for VLC, mpv and Home Assistant</li></ul>
+      <code class="cmd">./wyzecam-rtsp.py --web</code>
+    </div>
+    <div><div class="shot"><img src="screenshots/web-grid.jpg" alt="Browser view showing nine cameras, one offline" loading="lazy"></div><p class="cap">Illustrated mockup, styled with the page's real stylesheet. Boat Dock is offline.</p></div>
+  </div>
+  <div class="feature flip">
+    <div class="txt">
+      <div class="kicker">// any screen</div>
+      <h3>From your pocket to the living room.</h3>
+      <p>The same page works on any screen size. Phones get a scrolling list; TVs and desktops get the full grid.</p>
+      <code class="cmd">./wyzecam-rtsp.py serve -c "front gate,grand entrance,motor court,infinity pool"</code>
+    </div>
+    <div><div class="shot"><img src="screenshots/web-devices.jpg" alt="Browser view on a phone and a TV" loading="lazy"></div><p class="cap">Illustrated mockup</p></div>
+  </div>
+  <div class="feature">
+    <div class="txt">
+      <div class="kicker">// nas recording</div>
+      <h3>Your own NVR. No monthly fee.</h3>
+      <p>Point it at a mounted NAS share and every camera records into its own folder. Files are cut on the clock (every 5 minutes by default), so finding 2:15 pm takes one look.</p>
+      <ul><li>Video copied as-is, not re-encoded, so it barely uses any CPU</li><li><code>.mkv</code> files stay playable even after a power cut</li><li>Old recordings deleted automatically (<code>--keep 7</code>)</li><li>Hidden cameras keep recording</li></ul>
+      <code class="cmd">./wyzecam-rtsp.py serve --web --record /mnt/nas/cams</code>
+    </div>
+    <div><div class="shot"><img src="screenshots/record-serve.jpg" alt="Terminal running serve, next to a NAS folder of recordings" loading="lazy"></div><p class="cap">Illustrated mockup. The terminal text follows the real output format.</p></div>
+  </div>
+  <div class="feature flip">
+    <div class="txt">
+      <div class="kicker">// home assistant</div>
+      <h3>Into Home Assistant in about a minute.</h3>
+      <p><code>ha</code> prints exactly what to type into Home Assistant for each camera. It needs no login and never prints your password.</p>
+      <ul><li><b>Option A:</b> Generic Camera, straight from the camera's RTSPS stream</li><li><b>Option B:</b> MJPEG through the browser view, which adds no load on the camera</li></ul>
+      <code class="cmd">./wyzecam-rtsp.py ha</code>
+    </div>
+    <div><div class="shot"><img src="screenshots/home-assistant.jpg" alt="Output of the ha command" loading="lazy"></div><p class="cap">Illustrated mockup of the real command output</p></div>
+  </div>
+  <div class="feature">
+    <div class="txt">
+      <div class="kicker">// proof</div>
+      <h3>Not just a mockup: here it is running.</h3>
+      <p>This is an unedited capture of the real browser view, serving four simulated cameras with test-pattern video. The login, live updates and per-camera status dots are all working.</p>
+    </div>
+    <div><div class="shot"><img src="screenshots/real-capture.jpg" alt="Real capture of the browser view with test-pattern streams" loading="lazy"></div><p class="cap">Real capture: four simulated cameras with test patterns</p></div>
+  </div>
+</div></section>
+
+<section id="status"><div class="wrap">
+  <div class="kicker">// honest status</div>
+  <h2>What works, and what still needs checking.</h2>
+  <p class="sub">The grid is used daily on real cameras. The new features were built and tested against simulated camera streams and haven't been run on a real Wyze cam yet. If you try them, please open an issue and say how it went.</p>
+  <div class="board">
+    <div class="col ok">
+      <h3><span class="dot" style="background:var(--acc)"></span>Works on real cameras</h3>
+      <p class="note">Linux (Pop!_OS), Cam v3, Cam Pan v3, Cam v4 RTSP firmware</p>
+      <ul>
+        <li>Network scan, saved camera list and naming</li>
+        <li>Live grid with names, zoom and fullscreen</li>
+        <li>Rearrange, hide, rename and save the layout from the keyboard</li>
+        <li>Per-camera reconnect, watchdog and staggered resync</li>
+        <li>Automatic switch to the substream for weak-Wi-Fi cameras</li>
+        <li>GPU decoding (VA-API)</li>
+        <li>Logs with passwords removed</li>
+      </ul>
+    </div>
+    <div class="col sim">
+      <h3><span class="dot" style="background:var(--acc2)"></span>Works on simulated streams</h3>
+      <p class="note">Tested here with simulated camera streams</p>
+      <ul>
+        <li>Browser view: login, live snapshots at about 10 fps, MJPEG stream, phone layout</li>
+        <li>Recording: files cut on the clock, video plus AAC audio</li>
+        <li>Recording files close cleanly on Ctrl+C</li>
+        <li>Old recordings deleted; files the tool didn't make are left alone</li>
+        <li>Recording folder checked before start; camera names made safe for folders</li>
+        <li><code>serve</code> with no window, reconnects included</li>
+        <li><code>ha</code> output, including on Windows</li>
+      </ul>
+    </div>
+    <div class="col chk">
+      <h3><span class="dot" style="background:var(--warn)"></span>Needs checking</h3>
+      <p class="note">On real hardware, before calling it done</p>
+      <ul>
+        <li>Recordings from real Wyze streams play at the right speed (they're timestamped by arrival time)</li>
+        <li>Recording and browser view over a real camera's RTSPS login</li>
+        <li>Grid window running with <code>--record</code> / <code>--web</code> (mpv was simulated)</li>
+        <li>Home Assistant accepting both kinds of URL</li>
+        <li>CPU load of the browser view with many main streams</li>
+        <li>A NAS share dropping mid-recording</li>
+        <li>First run on a real Mac and a real Windows PC</li>
+      </ul>
+    </div>
+  </div>
+</div></section>
+
+<section id="start" style="background:var(--bg2);border-top:1px solid var(--line)"><div class="wrap">
+  <div class="kicker">// get started</div>
+  <h2>Three steps. Two minutes.</h2>
+  <p class="sub">Turn on RTSP for each camera in the Wyze app (camera → Settings → Advanced Settings → RTSP) and set a username and password. Then:</p>
+  <div class="term"><div class="bar"><span style="background:#ff5f57"></span><span style="background:#febc2e"></span><span style="background:#28c840"></span></div>
+<pre><span class="c"># 1. install the two helpers (Linux shown; macOS: brew, Windows: winget)</span>
+<span class="p">$</span> sudo apt install python3 ffmpeg mpv
+
+<span class="c"># 2. scan your network and open the grid</span>
+<span class="p">$</span> ./wyzecam-rtsp.py --scan
+
+<span class="c"># 3. go further</span>
+<span class="p">$</span> ./wyzecam-rtsp.py --web --record /mnt/nas/cams     <span class="c"># grid + browser + recording</span>
+<span class="p">$</span> ./wyzecam-rtsp.py serve --web --record /mnt/nas/cams <span class="c"># same, no window</span>
+<span class="p">$</span> ./wyzecam-rtsp.py ha                               <span class="c"># Home Assistant setup</span></pre>
+  </div>
+
+  <div class="faq">
+    <div><h4>Does my video go to the cloud?</h4><p>No. Video goes straight from each camera to your computer over your home network, and the tool needs no internet connection.</p></div>
+    <div><h4>Can I still use the Wyze app?</h4><p>Yes. Alerts, event clips and settings keep working. On weak Wi-Fi, opening live view on your phone may briefly drop that camera's tile, and the grid reconnects it.</p></div>
+    <div><h4>Which cameras work?</h4><p>Wyze cameras whose firmware offers RTSP: tested on Cam v3, Cam Pan v3 and Cam v4 (RTSP firmware). Other RTSP cameras may need a different port or path.</p></div>
+    <div><h4>Is the browser view safe to expose?</h4><p>It's plain HTTP behind your RTSP password, made for your home network. Don't forward it to the internet; use <code>--web-bind 127.0.0.1</code> to allow only this computer.</p></div>
+  </div>
+</div></section>
+
+<div class="final"><div class="wrap">
+  <h2>Your cameras, on your terms.</h2>
+  <p class="sub" style="margin:0 auto">Free, open source and in one file. Star it, try it, and open an issue saying how it ran on your cameras.</p>
+  <div class="cta"><a class="btn primary" href="https://github.com/crash101g/wyzecam-rtsp">★ Star on GitHub</a><a class="btn ghost" href="https://github.com/crash101g/wyzecam-rtsp/issues">Report how it went</a></div>
+</div></div>
+
+<footer><div class="wrap">
+  <span>wyzecam-rtsp · GPL-3.0 · by <a href="https://github.com/crash101g">crash101g</a></span>
+  <span>Independent project, not affiliated with or endorsed by Wyze. Estate scenes are illustrated mockups.</span>
+</div></footer>
+</body>
+</html>
