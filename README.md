@@ -3,8 +3,8 @@
 View your Wyze cameras' built-in RTSP streams in one live grid on **Linux, macOS or Windows**:
 no Wyze app and no cloud. It scans your network, finds the cameras, and shows them tiled in a
 single window with names, auto-reconnect, and live rearranging. It can also **record every
-camera to a NAS**, show them in **any web browser**, and hand them to **Home Assistant**, all from
-one connection per camera.
+camera to your PC or a NAS**, show them in **any web browser**, spot **people and pets with local
+AI**, and hand them to **Home Assistant**, all from one connection per camera.
 
 ![Nine estate cameras live in one window](screenshots/hero.jpg)
 
