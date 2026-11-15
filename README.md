@@ -197,6 +197,62 @@ video right now.
 - Decoding every camera for the browser costs CPU. On a small server, add `--sub` (substreams).
 - Windows: allow Python on **Private networks** if the firewall asks.
 
+## Local AI detection (`--detect`)
+
+Detects **people, dogs and cats** (plus cars, trucks, birds and 70 other things if you ask)
+**on your own computer**, with no cloud and no subscription.
+
+![Browser view with detections and the events panel](docs/screenshots/detect-web.jpg)
+
+*Real capture: two test cameras playing a sample photo from the YOLOX project (Apache-2.0), with live boxes and the events panel (press **e**).*
+
+```
+python3 -m pip install onnxruntime numpy          # once (Linux: add --break-system-packages)
+./wyzecam-rtsp.py --detect                        # grid with boxes around people and pets
+./wyzecam-rtsp.py serve --web --detect            # no window: browser view + detection
+./wyzecam-rtsp.py serve --detect --record ~/Videos/wyzecams --rec-format mp4 --keep 1
+./wyzecam-rtsp.py --detect --detect-labels person,dog,cat,car --detect-cams "front door,driveway"
+```
+
+What you get:
+- **Boxes on the tiles** in the grid and the browser view, coloured by type: red for people,
+  green for pets, blue for vehicles.
+- **One event per visit, not hundreds.** Objects are tracked, so someone walking across the yard
+  is a single event, which ends 30 s after they leave.
+- **A snapshot of each event** with the objects outlined, saved to
+  `events/YYYY-MM-DD/`, plus a line in `events/events.jsonl` (start and end, with duration).
+  Kept 7 days (`--detect-keep`).
+- **An events panel** in the browser view: press **e** or tap **Events**, then tap a thumbnail to
+  open the snapshot.
+- **Home Assistant / automations:** `--detect-webhook URL` POSTs each new detection as JSON. In
+  Home Assistant, create an automation with a **Webhook** trigger and use its URL
+  (`http://homeassistant.local:8123/api/webhook/<id>`). The JSON has `camera`, `label`,
+  `score`, `snapshot` and `time`.
+
+How it stays light:
+- Each camera's existing connection sends **2 small frames a second** (`--detect-fps`) to one
+  shared AI model, so the cameras get no extra load.
+- A **motion check** runs first. The AI only looks when something moved, while it's following an
+  object, or every 10 s (to catch something that arrived and stopped).
+- **Models** come from [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) (Apache-2.0,
+  trained on COCO). Each is downloaded once into `models/` and checksum-verified:
+
+  | `--detect-model` | Size | Time per check* | Notes |
+  |---|---|---|---|
+  | `nano` | 4 MB | ~20 ms | Fastest. Mixes up pets more often. |
+  | `tiny` (default) | 20 MB | ~65 ms | Good balance. |
+  | `s` | 36 MB | ~240 ms | Most accurate. Fine for a few cameras. |
+
+  \*Measured on a 2-core cloud VM. A desktop CPU is usually faster. The 10-minute status line in
+  the log shows your real number.
+- The motion-first and object-tracking design follows [Frigate NVR](https://github.com/blakeblackshear/frigate)'s
+  approach. No Frigate code or models are included.
+
+**Packages:** the standard COCO-trained models have no "package" label. To add one, train or
+download an ONNX model that detects packages and pass it with `--detect-model my_model.onnx`.
+Put its class names in `my_model.txt` next to it, one per line. Models in the YOLOX layout and
+the YOLOv8/v9 layout both work. Check the model's license before sharing it.
+
 ## Home Assistant (`ha`)
 
 ```
@@ -281,3 +337,7 @@ If anything fails, run it again with `--verbose` and keep the terminal output an
 | Recordings play too fast or too slow | Please open an issue with `wyzecam-rtsp-ffmpeg.log`: the recordings use the time each frame arrived as its timestamp, because Wyze streams don't carry usable ones |
 | Browser view keeps asking for a login | Use the RTSP username/password, not your Wyze account |
 | Browser view says the port is in use | Pick another: `--web 8081` |
+| "object detection needs two Python packages" | `python3 -m pip install onnxruntime numpy` (Linux: add `--break-system-packages`, or use a venv) |
+| Detection is slow / high CPU | `--detect-model nano`, `--detect-fps 1`, or `--detect-cams` to limit it to the cameras that matter |
+| Too many false alarms | Raise `--detect-score 0.6`, or use `--detect-model s` |
+| A pet is sometimes called a cat, sometimes a dog | Normal for small models. Tracking keeps it as one event; `--detect-model s` is better at it |

@@ -28,6 +28,8 @@ OTHER COMMANDS
   ./wyzecam-rtsp.py serve --web --record /mnt/nas/cams
                                         no window: browser view and/or recording (servers)
   ./wyzecam-rtsp.py ha                  print Home Assistant setup for each camera
+  ./wyzecam-rtsp.py serve --web --detect
+                                        no window: browser view with live AI detection
 
 RECORDING AND BROWSER VIEW (grid or 'serve'; each camera still uses ONE camera session)
   --record DIR       record every camera into DIR/<camera name>/ (video copied as-is)
@@ -36,6 +38,13 @@ RECORDING AND BROWSER VIEW (grid or 'serve'; each camera still uses ONE camera s
   --segment MIN      minutes per recording file (default 5)
   --web [PORT]       browser view at http://this-pc:PORT/ (default 8080), RTSP login required
   --web-bind ADDR    127.0.0.1 = only this computer (default: whole LAN)
+
+LOCAL AI DETECTION (grid or 'serve'; one-time setup: pip install onnxruntime numpy)
+  --detect           detect people, dogs and cats; boxes on the tiles, snapshots + events log
+  --detect-labels L  what to detect (default person,dog,cat; e.g. add car,truck,bird)
+  --detect-model M   nano (fastest) / tiny (default) / s (most accurate) / your own .onnx file
+  --detect-cams LIST only these cameras     --detect-fps N    checks per second (default 2)
+  --detect-webhook URL  POST each new detection as JSON (e.g. to Home Assistant)
 
 PLAYBACK SWITCHES
   -c, --cam LIST     only these cameras (comma-separated; names, IPs, or last IP number;
@@ -68,7 +77,7 @@ SETUP (once)
 Login: you're prompted for username and password; Enter accepts DEFAULT_USER /
 DEFAULT_PASS below if you've filled them in. $WYZE_RTSP_USER / $WYZE_RTSP_PASS skip the prompts.
 App folder: cameras.json and logs live next to the script ($WYZECAM_RTSP_DIR overrides).
-Needs: python3, ffmpeg (ffmpeg + ffprobe), mpv.
+Needs: python3, ffmpeg (ffmpeg + ffprobe), mpv. For --detect also: onnxruntime, numpy.
 """
 import argparse
 import concurrent.futures as cf
@@ -120,6 +129,14 @@ WEB_PORT = 8080
 WEB_WIDTH = 960
 WEB_EVERY = 2           # Wyze cams send ~20 fps -> ~10 fps in the browser
 WEB_QUALITY = 6         # JPEG quality: 2 (best, biggest) .. 31 (worst, smallest)
+# Object detection (--detect): small frames from each camera go to one shared AI model.
+DET_W, DET_H = 640, 360         # frame size sent to the detector (16:9, like the cameras)
+DET_FPS = 2                     # frames per second checked per camera (cameras send ~20)
+DET_SCORE = 0.5                 # minimum confidence for a detection to count
+DET_LABELS = "person,dog,cat"   # what to report by default (--detect-labels)
+DET_HEARTBEAT = 10              # also check this often (s) with no motion: still objects
+DET_GONE = 30                   # an object unseen this long (s) ends its event
+DET_KEEP_DAYS = 7               # event snapshots/log kept this long
 
 
 # --------------------------------------------------------------------------- helpers
@@ -609,14 +626,16 @@ def drawtext_escape(t):
 
 def camera_ffmpeg_cmd(url, tile_w, tile_h, hwaccel=True, keep_every=2, gpu_scale=False,
                       tiles=True, rec_pattern=None, rec_segment=300, jpeg_port=None,
-                      rec_format="mkv", hevc=False):
-    """One ffmpeg per camera, i.e. ONE camera session, with up to three outputs:
+                      rec_format="mkv", hevc=False, det_port=None, det_every=10):
+    """One ffmpeg per camera, i.e. ONE camera session, with up to four outputs:
       tiles       decode, keep every Nth frame (counted, since Wyze streams have no usable
                   timestamps), scale to the tile, raw YUV420 frames on stdout (the grid)
       rec_pattern copy the video as-is (no re-encoding) into clock-aligned .mkv/.mp4 segments
       jpeg_port   JPEG snapshots for the browser view, sent to a local TCP port
+      det_port    small RGB frames (every Nth) for object detection, to a local TCP port
     gpu_scale: decode AND shrink on the GPU (VA-API), copy only the small tile back."""
-    gpu = hwaccel and gpu_scale and IS_LINUX and jpeg_port is None   # VA-API (Linux) only
+    gpu = (hwaccel and gpu_scale and IS_LINUX and jpeg_port is None
+           and det_port is None)                                    # VA-API (Linux) only
     cmd = ["ffmpeg", "-loglevel", "error" if not VERBOSE else "warning",
            *input_args(url, hwaccel, gpu, wallclock=rec_pattern is not None, progress=not tiles)]
     if tiles:
@@ -653,7 +672,13 @@ def camera_ffmpeg_cmd(url, tile_w, tile_h, hwaccel=True, keep_every=2, gpu_scale
                        f"scale='min({WEB_WIDTH},iw)':-2",
                 "-fps_mode", "passthrough", "-pix_fmt", "yuvj420p", "-c:v", "mjpeg",
                 "-q:v", str(WEB_QUALITY), "-f", "image2pipe", f"tcp://127.0.0.1:{jpeg_port}"]
-    if not tiles and not rec_pattern and not jpeg_port:
+    if det_port:
+        cmd += ["-map", "0:v:0", "-an",
+                "-vf", f"select='not(mod(n\\,{det_every}))',settb=1/1000,setpts=N*100,"
+                       f"scale={DET_W}:{DET_H}",
+                "-fps_mode", "passthrough", "-pix_fmt", "rgb24", "-f", "rawvideo",
+                f"tcp://127.0.0.1:{det_port}"]
+    if not tiles and not rec_pattern and not jpeg_port and not det_port:
         cmd += ["-map", "0:v:0", "-c", "copy", "-f", "null", "-"]
     return cmd
 
@@ -683,8 +708,15 @@ class CameraFeed(threading.Thread):
     lighter substream + CPU decoding if the main stream keeps dropping."""
     def __init__(self, cam, user, password, path, tile_w, tile_h, stop, keep_every, cfg_cam=None,
                  gpu_scale=False, tiles=True, rec_root=None, rec_segment=300, web=False,
-                 rec_format="mkv"):
+                 rec_format="mkv", detect=False, det_every=10):
         super().__init__(daemon=True)
+        self.detect = detect       # True = also send small frames to the object detector
+        self.det_every = det_every
+        self.det_frame = None      # newest DET_W x DET_H RGB frame (bytes) and its number
+        self.det_seq = 0
+        self.dets = []             # objects currently tracked: [(label, score, x1, y1, x2, y2)]
+                                   # with coordinates as fractions of the frame (0..1)
+        self.dets_ver = 0          # bumped whenever dets changes (so the grid repaints)
         self.tiles = tiles         # False = headless (no grid): no raw frames are decoded for us
         self.rec_root = rec_root   # Path: record into rec_root/<camera name>/
         self.rec_segment = rec_segment
@@ -767,6 +799,45 @@ class CameraFeed(threading.Thread):
         finally:
             conn.close()
 
+    @staticmethod
+    def _open_tap(reader, taps):
+        """A local TCP port that one of ffmpeg's extra outputs connects to, served by `reader`."""
+        lst = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        lst.bind(("127.0.0.1", 0))
+        lst.listen(1)
+        th = threading.Thread(target=reader, args=(lst,), daemon=True)
+        th.start()
+        taps.append((lst, th))
+        return lst
+
+    def _det_reader(self, listener):
+        """Receive ffmpeg's small RGB frames for the detector; keep only the newest."""
+        size = DET_W * DET_H * 3
+        try:
+            listener.settimeout(FIRST_FRAME_SECS + 15)
+            conn, _ = listener.accept()
+        except OSError:
+            return
+        finally:
+            listener.close()
+        buf = bytearray(size)
+        mv = memoryview(buf)
+        try:
+            conn.settimeout(None)
+            while True:
+                n = 0
+                while n < size:
+                    r = conn.recv_into(mv[n:])
+                    if not r:
+                        return
+                    n += r
+                self.det_frame = bytes(buf)
+                self.det_seq += 1
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
     def _progress_reader(self, out, first_frame):
         """Headless: ffmpeg's -progress lines tell us video is still arriving. 'frame=' counts
         only re-encoded video (the browser view's JPEGs); when recording alone, everything is
@@ -835,19 +906,17 @@ class CameraFeed(threading.Thread):
             errlines = []
             frames_before = self.frames
             ff = [None]                    # time of this session's first frame
-            listener, jt = None, None
-            if self.web:                   # local port for ffmpeg's JPEG output
-                listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                listener.bind(("127.0.0.1", 0))
-                listener.listen(1)
-                jt = threading.Thread(target=self._jpeg_reader, args=(listener,), daemon=True)
-                jt.start()
+            taps = []                      # local ports for ffmpeg's JPEG / detection outputs
+            listener = self._open_tap(self._jpeg_reader, taps) if self.web else None
+            dlistener = self._open_tap(self._det_reader, taps) if self.detect else None
             self.proc = popen_ffmpeg(
                 camera_ffmpeg_cmd(self.url(), self.w, self.h, self.hwaccel, self.keep_every,
                                   self.gpu_scale, tiles=self.tiles, rec_pattern=self.rec_pattern(),
                                   rec_segment=self.rec_segment, rec_format=self.rec_format,
                                   hevc=str(self.cam.get("video", "")).lower().startswith(("hevc", "h265")),
-                                  jpeg_port=listener.getsockname()[1] if listener else None),
+                                  jpeg_port=listener.getsockname()[1] if listener else None,
+                                  det_port=dlistener.getsockname()[1] if dlistener else None,
+                                  det_every=self.det_every),
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
             et = threading.Thread(target=self._stderr_reader, args=(self.proc.stderr, errlines), daemon=True)
             et.start()
@@ -875,12 +944,12 @@ class CameraFeed(threading.Thread):
                 threading.Thread(target=_drain, args=(out,), daemon=True).start()
                 stop_ffmpeg(self.proc)
                 et.join(timeout=2)
-                if listener is not None:
+                for lst, th in taps:
                     try:
-                        listener.close()       # unblocks accept() if ffmpeg never connected
+                        lst.close()            # unblocks accept() if ffmpeg never connected
                     except OSError:
                         pass
-                    jt.join(timeout=2)
+                    th.join(timeout=2)
             first_frame = ff[0]
             if self.stop.is_set():
                 break
@@ -1143,6 +1212,393 @@ def log_status(feeds, now):
         f"(drops {f.drops})" for f in feeds))
 
 
+# --------------------------------------------------------------------------- object detection
+# Local AI detection: no cloud, no subscription. Each camera's existing ffmpeg sends a few small
+# frames a second; a cheap motion check decides whether the AI model needs to look at all; the
+# model's detections are tracked so one person crossing the yard is ONE event, not hundreds.
+# (The motion-first / track-objects approach follows Frigate NVR's design; no Frigate code or
+# models are used.) Models: YOLOX by Megvii (Apache-2.0), trained on the COCO dataset.
+YOLOX_URL = "https://github.com/Megvii-BaseDetection/YOLOX/releases/download/0.1.1rc0/"
+DET_MODELS = {   # name: (file, size in bytes, sha256)
+    "nano": ("yolox_nano.onnx", 3659407,
+             "c789161ed43c8269fcd4e67c67eeeb4e80c622da2eb296a20bc6007bd18a0b7d"),
+    "tiny": ("yolox_tiny.onnx", 20219662,
+             "427cc366d34e27ff7a03e2899b5e3671425c262ea2291f88bb942bc1cc70b0f7"),
+    "s": ("yolox_s.onnx", 35858002,
+          "c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063"),
+}
+COCO_LABELS = (
+    "person bicycle car motorcycle airplane bus train truck boat traffic_light fire_hydrant "
+    "stop_sign parking_meter bench bird cat dog horse sheep cow elephant bear zebra giraffe "
+    "backpack umbrella handbag tie suitcase frisbee skis snowboard sports_ball kite baseball_bat "
+    "baseball_glove skateboard surfboard tennis_racket bottle wine_glass cup fork knife spoon bowl "
+    "banana apple sandwich orange broccoli carrot hot_dog pizza donut cake chair couch potted_plant "
+    "bed dining_table tv laptop mouse remote keyboard cell_phone microwave oven toaster sink "
+    "refrigerator book clock vase scissors teddy_bear hair_drier toothbrush").split()
+LABEL_COLORS = {"person": "#ff4d4d", "dog": "#3cf05a", "cat": "#3cf05a", "bird": "#3cf05a",
+                "car": "#3cb4ff", "truck": "#3cb4ff", "bicycle": "#3cb4ff",
+                "motorcycle": "#3cb4ff", "package": "#ffb43c"}
+
+
+def label_color(label):
+    return LABEL_COLORS.get(label, "#ff5cf0")
+
+
+def need_ai():
+    try:
+        import numpy
+        import onnxruntime
+    except ImportError:
+        extra = " --break-system-packages" if IS_LINUX else ""
+        die("object detection needs two Python packages (a one-time install):\n"
+            f"       {'py -m pip' if IS_WIN else 'python3 -m pip'} install onnxruntime numpy{extra}")
+    return numpy, onnxruntime
+
+
+def get_model(spec):
+    """Path of the detection model: 'nano' / 'tiny' / 's' are downloaded once (and checked)
+    into the app folder; anything else is a path to your own ONNX model."""
+    import hashlib
+    import urllib.request
+    if spec not in DET_MODELS:
+        p = Path(spec).expanduser()
+        if not p.is_file():
+            die(f"detection model not found: {p}  (use nano, tiny, s, or a path to an .onnx file)")
+        return p
+    fname, size, sha = DET_MODELS[spec]
+    p = APP_DIR / "models" / fname
+    if p.is_file() and p.stat().st_size == size:
+        return p
+    p.parent.mkdir(parents=True, exist_ok=True)
+    url = YOLOX_URL + fname
+    print(f"Downloading the {spec} detection model ({size / 1e6:.0f} MB, once) from\n  {url}")
+    tmp = p.with_suffix(".part")
+    try:
+        h = hashlib.sha256()
+        with urllib.request.urlopen(url, timeout=60) as r, open(tmp, "wb") as fh:
+            while True:
+                chunk = r.read(1 << 20)
+                if not chunk:
+                    break
+                fh.write(chunk)
+                h.update(chunk)
+        if h.hexdigest() != sha:
+            tmp.unlink()
+            die("the downloaded model didn't match its checksum — try again later")
+        tmp.replace(p)
+    except OSError as e:
+        die(f"couldn't download the model ({e}).\n       Download {url}\n"
+            f"       yourself and put it at {p}")
+    return p
+
+
+def nms(np, boxes, scores, iou=0.45):
+    """Non-maximum suppression: keep the best box among heavily overlapping ones."""
+    x1, y1, x2, y2 = boxes.T
+    area = (x2 - x1) * (y2 - y1)
+    order = scores.argsort()[::-1]
+    keep = []
+    while order.size:
+        i = order[0]
+        keep.append(i)
+        rest = order[1:]
+        w = np.maximum(0, np.minimum(x2[i], x2[rest]) - np.maximum(x1[i], x1[rest]))
+        h = np.maximum(0, np.minimum(y2[i], y2[rest]) - np.maximum(y1[i], y1[rest]))
+        inter = w * h
+        order = rest[inter / (area[i] + area[rest] - inter + 1e-9) <= iou]
+    return keep
+
+
+class Detector:
+    """One ONNX model shared by every camera. Understands two common output layouts:
+      YOLOX            [1, N, 5 + classes]  (the bundled models)
+      YOLOv8/v9 style  [1, 4 + classes, N]  (bring your own, e.g. one trained on packages)
+    Class names: COCO, or <model>.txt next to your own model (one name per line)."""
+    def __init__(self, model_path):
+        np, ort = need_ai()
+        self.np = np
+        so = ort.SessionOptions()
+        so.intra_op_num_threads = max(1, min(4, os.cpu_count() or 2))
+        so.log_severity_level = 3
+        self.sess = ort.InferenceSession(str(model_path), so, providers=["CPUExecutionProvider"])
+        inp = self.sess.get_inputs()[0]
+        self.inp = inp.name
+        self.S = inp.shape[2] if isinstance(inp.shape[2], int) else 640
+        names = Path(model_path).with_suffix(".txt")
+        self.labels = ([ln.strip() for ln in names.read_text().splitlines() if ln.strip()]
+                       if names.is_file() else COCO_LABELS)
+        shape = self.sess.get_outputs()[0].shape
+        n = len(self.labels)
+        self.yolox = not (len(shape) == 3 and shape[1] == 4 + n)
+        S = self.S
+        self.r = min(S / DET_H, S / DET_W)                    # letterbox scale
+        self.nh, self.nw = int(DET_H * self.r), int(DET_W * self.r)
+        self.yi = (np.arange(self.nh) / self.r).astype(int)  # nearest-neighbour resize indices
+        self.xi = (np.arange(self.nw) / self.r).astype(int)
+        if self.yolox:
+            grids, strides = [], []
+            for st in (8, 16, 32):
+                g = S // st
+                yv, xv = np.meshgrid(np.arange(g), np.arange(g), indexing="ij")
+                grids.append(np.stack((xv, yv), 2).reshape(-1, 2))
+                strides.append(np.full((g * g, 1), st))
+            self.grids, self.strides = np.concatenate(grids), np.concatenate(strides)
+
+    def detect(self, rgb, min_score):
+        """rgb: DET_H x DET_W x 3 array. Returns [(label, score, x1, y1, x2, y2)] with the box
+        as fractions (0..1) of the frame."""
+        np, S = self.np, self.S
+        img = np.full((S, S, 3), 114, np.uint8)
+        small = rgb[self.yi][:, self.xi]
+        if self.yolox:
+            img[:self.nh, :self.nw] = small[:, :, ::-1]             # YOLOX wants BGR, 0-255
+            x = img.transpose(2, 0, 1)[None].astype(np.float32)
+        else:
+            img[:self.nh, :self.nw] = small
+            x = img.transpose(2, 0, 1)[None].astype(np.float32) / 255.0
+        out = self.sess.run(None, {self.inp: x})[0][0]
+        if self.yolox:
+            xy = (out[:, :2] + self.grids) * self.strides
+            wh = np.exp(np.clip(out[:, 2:4], -10, 10)) * self.strides
+            scores = out[:, 4:5] * out[:, 5:]
+        else:
+            out = out.T                                              # [N, 4 + classes]
+            xy, wh, scores = out[:, :2], out[:, 2:4], out[:, 4:]
+        cls = scores.argmax(1)
+        conf = scores[np.arange(len(cls)), cls]
+        keep = conf >= min_score
+        if not keep.any():
+            return []
+        xy, wh, cls, conf = xy[keep], wh[keep], cls[keep], conf[keep]
+        boxes = np.concatenate([xy - wh / 2, xy + wh / 2], 1) / self.r
+        k = nms(np, boxes + (cls * 4096)[:, None], conf)              # per-class
+        # Then across classes: the same animal seen as both "dog" and "cat" keeps the better one.
+        k = [k[j] for j in nms(np, boxes[k], conf[k], iou=0.8)]
+        res = []
+        for i in k:
+            x1, y1, x2, y2 = boxes[i]
+            res.append((self.labels[cls[i]] if cls[i] < len(self.labels) else str(cls[i]),
+                        float(conf[i]),
+                        max(0.0, x1 / DET_W), max(0.0, y1 / DET_H),
+                        min(1.0, x2 / DET_W), min(1.0, y2 / DET_H)))
+        return res
+
+
+LABEL_GROUPS = {"dog": "pet", "cat": "pet", "car": "vehicle", "truck": "vehicle"}
+
+
+def same_kind(a, b):
+    """Labels the model often mixes up for one object count as the same thing when tracking."""
+    return a == b or (a in LABEL_GROUPS and LABEL_GROUPS.get(a) == LABEL_GROUPS.get(b))
+
+
+def iou(a, b):
+    w = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    h = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = w * h
+    return inter / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter + 1e-9)
+
+
+class DetectionEngine(threading.Thread):
+    """Looks at every camera's newest small frame a few times a second:
+      1. motion check (cheap): only call the AI model when something moved, an object is
+         being tracked, or every DET_HEARTBEAT s (to catch things that arrived and stopped)
+      2. AI model: people, pets, cars, ... (only the labels you asked for are kept)
+      3. tracking: a detection matching an existing object (same label, overlapping box)
+         updates it; an object seen twice starts an EVENT (snapshot + log + webhook); one
+         unseen for DET_GONE s ends it."""
+    def __init__(self, feeds, opts, stop):
+        super().__init__(daemon=True)
+        self.feeds, self.opts, self.stop = feeds, opts, stop
+        self.detector = opts.get("detector") or Detector(opts["model"])
+        self.np = self.detector.np
+        self.root = Path(opts["events_dir"])
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.recent = []                       # newest last; for the browser view
+        self.lock = threading.Lock()
+        self.ids = dict(zip([id(f) for f in feeds], cam_ids([f.cam for f in feeds])))
+        self.state = {id(f): {"seq": 0, "run": 0.0, "full": 0.0, "prev": None, "tracks": [],
+                              "next": 1} for f in feeds}
+        self.ms = []                           # recent model run times, for the status line
+
+    def run(self):
+        np = self.np
+        period = 1.0 / max(0.2, self.opts["fps"])
+        last_prune = 0.0
+        while not self.stop.is_set():
+            busy = False
+            now = time.time()
+            for f in self.feeds:
+                st = self.state[id(f)]
+                if f.det_frame is not None and f.det_seq != st["seq"] and now - st["run"] >= period:
+                    st["seq"] = f.det_seq
+                    st["run"] = now
+                    frame = np.frombuffer(f.det_frame, np.uint8).reshape(DET_H, DET_W, 3)
+                    small = frame[::8, ::8].mean(2)
+                    prev, st["prev"] = st["prev"], small
+                    moved = prev is None or (np.abs(small - prev) > 18).mean() > 0.002
+                    if moved or st["tracks"] or now - st["full"] >= DET_HEARTBEAT:
+                        st["full"] = now
+                        t0 = time.time()
+                        try:
+                            dets = self.detector.detect(frame, self.opts["score"])
+                        except Exception as e:            # never let the AI kill the viewer
+                            log(f"detection error: {e}")
+                            dets = []
+                        self.ms = (self.ms + [(time.time() - t0) * 1000])[-50:]
+                        dets = [d for d in dets if d[0] in self.opts["labels"]]
+                        self._track(f, st, dets, now, frame)
+                        busy = True
+                self._expire(f, st, now)
+            if now - last_prune > 1800:
+                last_prune = now
+                self._prune()
+            if not busy:
+                self.stop.wait(0.05)
+
+    def _track(self, f, st, dets, now, frame):
+        tracks, used = st["tracks"], set()
+        for d in sorted(dets, key=lambda d: -d[1]):
+            best, best_iou = None, 0.25
+            for t in tracks:
+                if same_kind(t["label"], d[0]) and id(t) not in used:
+                    o = iou(t["box"], d[2:])
+                    if o > best_iou:
+                        best, best_iou = t, o
+            if best is None:
+                best = {"id": st["next"], "label": d[0], "first": now, "hits": 0, "event": False}
+                st["next"] += 1
+                tracks.append(best)
+            votes = best.setdefault("votes", {})      # dog <-> cat flips: until the event
+            votes[d[0]] = votes.get(d[0], 0) + 1      # starts, use the label seen most often
+            if not best["event"]:
+                best["label"] = max(votes, key=votes.get)
+            best.update(box=d[2:], score=d[1], last=now, hits=best["hits"] + 1)
+            used.add(id(best))
+        for t in tracks:
+            if t["hits"] >= 2 and not t["event"]:
+                t["event"] = True
+                self._event_start(f, t, frame, tracks)
+        self._publish(f, st, now)
+
+    def _expire(self, f, st, now):
+        gone = [t for t in st["tracks"] if now - t["last"] > DET_GONE]
+        if gone:
+            st["tracks"] = [t for t in st["tracks"] if t not in gone]
+            for t in gone:
+                if t["event"]:
+                    self._write({"type": "end", "camera": f.name, "cam_id": self.ids[id(f)],
+                                 "label": t["label"], "track": t["id"],
+                                 "duration": round(t["last"] - t["first"], 1)})
+        self._publish(f, st, now)
+
+    def _publish(self, f, st, now):
+        """What the grid and browser view draw: confirmed objects seen in the last 2 s."""
+        cur = [(t["label"], round(t["score"], 2), *[round(v, 4) for v in t["box"]])
+               for t in st["tracks"] if t["hits"] >= 2 and now - t["last"] < 2]
+        if cur != f.dets:
+            f.dets = cur
+            f.dets_ver += 1
+
+    def _event_start(self, f, t, frame, tracks):
+        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        day = stamp[:10]
+        rel = f"{day}/{stamp}_{safe_name(f.name).replace(' ', '_')}_{safe_name(t['label'])}_{t['id']}.jpg"
+        ev = {"type": "start", "camera": f.name, "cam_id": self.ids[id(f)], "label": t["label"],
+              "score": round(t["score"], 2), "box": [round(v, 4) for v in t["box"]],
+              "track": t["id"], "snapshot": rel}
+        log(f"[{f.name}] detected {t['label'].replace('_', ' ')} ({t['score']:.0%})")
+        boxes = [(x["label"], x["score"], *x["box"]) for x in tracks
+                 if x["hits"] >= 2 and x["last"] >= t["last"] - 1]       # seen in this frame
+        threading.Thread(target=self._snapshot, args=(frame.tobytes(), boxes, self.root / rel),
+                         daemon=True).start()
+        self._write(ev)
+        if self.opts.get("webhook"):
+            threading.Thread(target=self._webhook, args=(dict(ev),), daemon=True).start()
+
+    def _snapshot(self, raw, boxes, path):
+        """Save the frame with the detected objects outlined and labelled (ffmpeg draws them)."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        vf = []
+        font = label_font()
+        for label, score, x1, y1, x2, y2 in boxes:
+            c = "0x" + label_color(label)[1:]
+            x, y = int(x1 * DET_W), int(y1 * DET_H)
+            w, h = max(2, int((x2 - x1) * DET_W)), max(2, int((y2 - y1) * DET_H))
+            text = drawtext_escape(f"{label.replace('_', ' ')} {score:.0%}")
+            vf.append(f"drawbox=x={x}:y={y}:w={w}:h={h}:color={c}@0.95:t=3")
+            vf.append(f"drawtext={font}expansion=none:text='{text}':x={x + 2}:y={max(0, y - 20)}:fontsize=16:"
+                      f"fontcolor=white:box=1:boxcolor={c}@0.85:boxborderw=3")
+        cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24",
+               "-s", f"{DET_W}x{DET_H}", "-i", "-"]
+        if vf:
+            cmd += ["-vf", ",".join(vf)]
+        cmd += ["-frames:v", "1", "-q:v", "4", str(path)]
+        try:
+            r = subprocess.run(cmd, input=raw, capture_output=True, timeout=15)
+            if r.returncode != 0 and vf:                     # e.g. no font: boxes only
+                cmd[cmd.index("-vf") + 1] = ",".join(v for v in vf if v.startswith("drawbox"))
+                subprocess.run(cmd, input=raw, capture_output=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    def _write(self, ev):
+        ev = {"time": time.strftime("%Y-%m-%dT%H:%M:%S"), "ts": round(time.time(), 3), **ev}
+        with self.lock:
+            self.recent = (self.recent + [ev])[-300:]
+            try:
+                with open(self.root / "events.jsonl", "a") as fh:
+                    fh.write(json.dumps(ev) + "\n")
+            except OSError:
+                pass
+
+    def _webhook(self, ev):
+        """POST the event as JSON (e.g. to a Home Assistant webhook trigger)."""
+        import urllib.request
+        try:
+            req = urllib.request.Request(self.opts["webhook"], data=json.dumps(ev).encode(),
+                                         headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=8).close()
+        except Exception as e:
+            log(f"webhook failed: {e}")
+
+    def _prune(self):
+        """Delete snapshot folders and log lines older than the keep period."""
+        keep = self.opts.get("keep", DET_KEEP_DAYS)
+        if keep <= 0:
+            return
+        cutoff = time.time() - keep * 86400
+        day_cut = time.strftime("%Y-%m-%d", time.localtime(cutoff))
+        for d in self.root.glob("????-??-??"):
+            if d.is_dir() and d.name < day_cut:
+                shutil.rmtree(d, ignore_errors=True)
+        jl = self.root / "events.jsonl"
+        try:
+            lines = jl.read_text().splitlines()
+            kept = [ln for ln in lines if json.loads(ln).get("ts", 0) >= cutoff]
+            if len(kept) != len(lines):
+                with self.lock:
+                    jl.write_text("".join(ln + "\n" for ln in kept))
+        except (OSError, ValueError):
+            pass
+
+    def events(self, limit=100):
+        with self.lock:
+            return list(reversed(self.recent[-limit:]))
+
+    def status(self):
+        ms = sorted(self.ms)
+        return f"{ms[len(ms) // 2]:.0f} ms per check" if ms else "idle"
+
+
+def start_detection(feeds, det, stop):
+    if not det:
+        return None
+    eng = DetectionEngine([f for f in feeds if f.detect], det, stop)
+    eng.start()
+    return eng
+
+
 # --------------------------------------------------------------------------- recording
 def check_rec_dir(rec):
     """Make sure the recording folder exists and is writable before any camera starts."""
@@ -1208,9 +1664,33 @@ WEB_PAGE = """<!doctype html>
   #bar{display:none}
  }
  #bar{position:fixed;right:8px;bottom:8px;opacity:.5;font-size:12px}
+ .box{position:absolute;border:3px solid var(--c);border-radius:3px;pointer-events:none;
+      box-shadow:0 0 0 1px rgba(0,0,0,.5)}
+ .box span{position:absolute;left:-3px;top:-22px;background:var(--c);color:#000;font:600 12px/18px
+      system-ui,sans-serif;padding:0 6px;border-radius:3px 3px 3px 0;white-space:nowrap}
+ .tile .tags{position:absolute;right:8px;top:8px;display:flex;gap:4px}
+ .tile .tags b{background:var(--c);color:#000;font-size:12px;padding:2px 7px;border-radius:4px}
+ #evbtn{position:fixed;left:8px;bottom:8px;z-index:20;background:#222;color:#eee;border:1px solid #444;
+      border-radius:8px;padding:6px 12px;font:600 13px system-ui,sans-serif;cursor:pointer;display:none}
+ #evbtn i{font-style:normal;background:#ff4d4d;color:#000;border-radius:9px;padding:0 6px;margin-left:6px}
+ #events{position:fixed;top:0;right:0;bottom:0;width:min(380px,100%);background:#161616;z-index:30;
+      border-left:1px solid #333;overflow-y:auto;display:none;padding:12px;box-sizing:border-box}
+ #events.open{display:block}
+ #events h3{margin:4px 0 12px;font-size:16px;display:flex;justify-content:space-between}
+ #events h3 a{color:#aaa;cursor:pointer;font-weight:400}
+ .ev{display:flex;gap:10px;margin-bottom:10px;cursor:pointer}
+ .ev img{width:136px;aspect-ratio:16/9;object-fit:cover;border-radius:4px;background:#000}
+ .ev div{font-size:13px;color:#bbb}
+ .ev b{display:block;color:#fff;font-size:14px}
+ .ev em{font-style:normal;color:var(--c);font-weight:700}
+ #full{position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:40;display:none;cursor:zoom-out}
+ #full img{width:100%;height:100%;object-fit:contain}
 </style></head><body>
 <div id="grid"></div>
-<div id="bar">click a camera to zoom · n = names · f = fullscreen</div>
+<div id="bar">click a camera to zoom · n = names · f = fullscreen · e = events</div>
+<button id="evbtn">Events<i id="evn">0</i></button>
+<div id="events"><h3>Detections <a id="evclose">close ✕</a></h3><div id="evlist"></div></div>
+<div id="full"><img alt=""></div>
 <script>
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function feed(cam, tile, img) {
@@ -1228,22 +1708,98 @@ async function feed(cam, tile, img) {
     } catch (e) { tile.classList.add("down"); await sleep(2000); }
   }
 }
+const COLORS = {person: "#ff4d4d", dog: "#3cf05a", cat: "#3cf05a", bird: "#3cf05a", car: "#3cb4ff",
+                truck: "#3cb4ff", bicycle: "#3cb4ff", motorcycle: "#3cb4ff", package: "#ffb43c"};
+const color = l => COLORS[l] || "#ff5cf0";
+const nice = l => l.replace(/_/g, " ");
+const esc = t => String(t).replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const tiles = {};
+function drawBoxes(t, dets) {
+  t.boxes.forEach(b => b.remove()); t.boxes = []; t.tags.textContent = "";
+  const img = t.img, W = t.tile.clientWidth, H = t.tile.clientHeight;
+  if (!img.naturalWidth) return;
+  const k = Math.min(W / img.naturalWidth, H / img.naturalHeight);       // object-fit: contain
+  const w = img.naturalWidth * k, h = img.naturalHeight * k, ox = (W - w) / 2, oy = (H - h) / 2;
+  const seen = new Set();
+  for (const [label, score, x1, y1, x2, y2] of dets) {
+    const b = document.createElement("div");
+    b.className = "box"; b.style.setProperty("--c", color(label));
+    Object.assign(b.style, {left: ox + x1 * w + "px", top: oy + y1 * h + "px",
+                            width: (x2 - x1) * w + "px", height: (y2 - y1) * h + "px"});
+    b.innerHTML = `<span>${esc(nice(label))} ${Math.round(score * 100)}%</span>`;
+    t.tile.append(b); t.boxes.push(b);
+    if (!seen.has(label)) {
+      seen.add(label);
+      const tag = document.createElement("b");
+      tag.style.setProperty("--c", color(label)); tag.textContent = nice(label); t.tags.append(tag);
+    }
+  }
+}
+async function detections() {
+  for (;;) {
+    try {
+      const d = await (await fetch("api/detections", {cache: "no-store"})).json();
+      for (const id in tiles) drawBoxes(tiles[id], d[id] || []);
+    } catch (e) {}
+    await sleep(500);
+  }
+}
+const evlist = document.getElementById("evlist"), panel = document.getElementById("events");
+const full = document.getElementById("full");
+let seenTs = 0;
+async function events() {
+  for (;;) {
+    try {
+      const evs = (await (await fetch("api/events?limit=60", {cache: "no-store"})).json())
+                    .filter(e => e.type === "start");
+      const fresh = evs.filter(e => e.ts > Date.now() / 1000 - 600).length;
+      document.getElementById("evn").textContent = fresh;
+      document.getElementById("evn").style.display = fresh ? "" : "none";
+      evlist.innerHTML = evs.length ? "" : "<div style='color:#888'>No detections yet.</div>";
+      for (const e of evs) {
+        const row = document.createElement("div");
+        row.className = "ev"; row.style.setProperty("--c", color(e.label));
+        row.innerHTML = `<img loading="lazy" src="events/${esc(e.snapshot)}" alt="">
+          <div><b>${esc(e.camera)}</b><em>${esc(nice(e.label))}</em> ${Math.round(e.score * 100)}%<br>
+          ${esc(e.time.replace("T", " "))}</div>`;
+        row.onclick = () => { full.querySelector("img").src = `events/${e.snapshot}`; full.style.display = "block"; };
+        evlist.append(row);
+      }
+    } catch (e) {}
+    await sleep(panel.classList.contains("open") ? 3000 : 10000);
+  }
+}
+const toggleEvents = () => panel.classList.toggle("open");
+document.getElementById("evbtn").onclick = toggleEvents;
+document.getElementById("evclose").onclick = toggleEvents;
+full.onclick = () => full.style.display = "none";
 fetch("api/cams", {cache: "no-store"}).then(r => r.json()).then(cams => {
   const grid = document.getElementById("grid");
   grid.style.setProperty("--cols", Math.ceil(Math.sqrt(cams.length)) || 1);
   for (const cam of cams) {
     const tile = document.createElement("div"), img = new Image(), name = document.createElement("div");
+    const tags = document.createElement("div");
     tile.className = "tile down"; name.className = "name"; name.textContent = cam.name;
-    tile.title = cam.name; tile.append(img, name); grid.append(tile);
+    tags.className = "tags";
+    tile.title = cam.name; tile.append(img, name, tags); grid.append(tile);
     tile.onclick = () => tile.classList.toggle("zoom");
+    tiles[cam.id] = {tile, img, tags, boxes: []};
     feed(cam, tile, img);
+  }
+  if (cams.some(c => c.detect)) {
+    document.getElementById("evbtn").style.display = "block";
+    detections(); events();
   }
 });
 document.addEventListener("keydown", e => {
   if (e.key === "n") document.body.classList.toggle("names-off");
   if (e.key === "f") document.fullscreenElement ? document.exitFullscreen()
                                                  : document.documentElement.requestFullscreen();
-  if (e.key === "Escape") document.querySelectorAll(".zoom").forEach(t => t.classList.remove("zoom"));
+  if (e.key === "e" && document.getElementById("evbtn").style.display === "block") toggleEvents();
+  if (e.key === "Escape") {
+    document.querySelectorAll(".zoom").forEach(t => t.classList.remove("zoom"));
+    panel.classList.remove("open"); full.style.display = "none";
+  }
 });
 </script></body></html>
 """
@@ -1262,7 +1818,7 @@ class WebView:
       /cam/ID.mjpg   MJPEG stream, for Home Assistant, VLC, mpv, etc.
       /api/cams      camera list (JSON)
     Protected by the RTSP username/password (HTTP Basic auth)."""
-    def __init__(self, feeds, port, bind, user, password, stop):
+    def __init__(self, feeds, port, bind, user, password, stop, engine=None):
         import base64
         import hmac
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1298,9 +1854,27 @@ class WebView:
                 if u.path == "/api/cams":
                     now = time.time()
                     data = [{"id": i, "name": f.name, "ip": f.cam["ip"],
-                             "live": bool(f.jpeg_time and now - f.jpeg_time < STALL_SECS)}
+                             "live": bool(f.jpeg_time and now - f.jpeg_time < STALL_SECS),
+                             "detect": bool(engine and f.detect)}
                             for i, f in by_id.items()]
                     return self.send(200, json.dumps(data).encode(), "application/json")
+                if u.path == "/api/detections":
+                    data = {i: f.dets for i, f in by_id.items() if f.detect}
+                    return self.send(200, json.dumps(data).encode(), "application/json")
+                if u.path == "/api/events":
+                    try:
+                        limit = max(1, min(300, int(parse_qs(u.query).get("limit", ["100"])[0])))
+                    except ValueError:
+                        limit = 100
+                    data = engine.events(limit) if engine else []
+                    return self.send(200, json.dumps(data).encode(), "application/json")
+                ev = re.fullmatch(r"/events/(\d{4}-\d\d-\d\d/[\w.\-]+\.jpg)", u.path)
+                if ev and engine:
+                    f = engine.root / ev.group(1)
+                    try:
+                        return self.send(200, f.read_bytes(), "image/jpeg")
+                    except OSError:
+                        return self.send(404, b"not found\n")
                 if not m or m.group(1) not in by_id:
                     return self.send(404, b"not found\n")
                 f = by_id[m.group(1)]
@@ -1341,6 +1915,10 @@ class WebView:
             daemon_threads = True
             allow_reuse_address = True
 
+            def handle_error(self, request, client_address):
+                if not isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+                    super().handle_error(request, client_address)   # a browser closing is normal
+
         try:
             self.httpd = Server((bind, port), Handler)
         except OSError as e:
@@ -1362,14 +1940,29 @@ class WebView:
             pass
 
 
-def start_extras(feeds, rec, web, user, password, stop):
-    """Start the recording pruner and the browser view (shared by the grid and 'serve')."""
+def start_extras(feeds, rec, web, user, password, stop, det=None):
+    """Start the recording pruner, object detection and the browser view (grid and 'serve')."""
     web_view = None
     if rec and rec["keep"] > 0:
         Pruner(rec["dir"], rec["keep"], stop).start()
+    engine = start_detection(feeds, det, stop)
     if web:
-        web_view = WebView(feeds, web["port"], web["bind"], user, password, stop)
-    return web_view
+        web_view = WebView(feeds, web["port"], web["bind"], user, password, stop, engine)
+    return web_view, engine
+
+
+def feed_opts(c, rec, web, det):
+    """CameraFeed options for recording, the browser view and detection."""
+    return dict(rec_root=rec and rec["dir"], rec_segment=rec["segment"] if rec else 300,
+                rec_format=rec["format"] if rec else "mkv", web=bool(web),
+                detect=bool(det) and (not det["cams"] or c["ip"] in det["cams"]),
+                det_every=det["every"] if det else 10)
+
+
+def print_detection(det, engine):
+    if engine:
+        print(f" Detecting {', '.join(sorted(det['labels']))} on {len(engine.feeds)} camera(s) "
+              f"(model: {Path(det['model']).name}); snapshots + log in {det['events_dir']}")
 
 
 def print_extras(rec, web_view, n):
@@ -1380,7 +1973,7 @@ def print_extras(rec, web_view, n):
         print(f" Browser view: {web_view.urls()}  (log in with your RTSP username/password)")
 
 
-def run_headless(cams, user, password, path, rec=None, web=None, resync_min=0):
+def run_headless(cams, user, password, path, rec=None, web=None, resync_min=0, det=None):
     """'serve': no window. Record and/or serve the browser view, e.g. on a server or in a
     container. Each camera still has its own ffmpeg (one camera session) and reconnect loop."""
     need("ffmpeg")
@@ -1388,10 +1981,8 @@ def run_headless(cams, user, password, path, rec=None, web=None, resync_min=0):
     cfg = load_saved()
     cfg_by_ip = {c["ip"]: c for c in cfg.get("cameras", [])}
     feeds = [CameraFeed(c, user, password, path, 0, 0, stop, 1, cfg_by_ip.get(c["ip"]),
-                        tiles=False, rec_root=rec and rec["dir"],
-                        rec_segment=rec["segment"] if rec else 300, web=bool(web),
-                        rec_format=rec["format"] if rec else "mkv") for c in cams]
-    web_view = start_extras(feeds, rec, web, user, password, stop)
+                        tiles=False, **feed_opts(c, rec, web, det)) for c in cams]
+    web_view, engine = start_extras(feeds, rec, web, user, password, stop, det)
     for f in feeds:
         f.start()
     n = len(feeds)
@@ -1408,11 +1999,13 @@ def run_headless(cams, user, password, path, rec=None, web=None, resync_min=0):
     print(bar)
     print(f" Serving {n} camera(s) with no window: " + ", ".join(c["name"] for c in cams))
     print_extras(rec, web_view, n)
+    print_detection(det, engine)
     print(" Press Ctrl+C to stop.")
     print(bar)
     log(f"serve started: {', '.join(c['name'] for c in cams)}"
         + (f"; recording to {rec['dir']}" if rec else "")
-        + (f"; browser view on port {web['port']}" if web else ""))
+        + (f"; browser view on port {web['port']}" if web else "")
+        + ("; detection on" if engine else ""))
     last_status = time.time()
     was_live = [False] * n
     try:
@@ -1428,6 +2021,8 @@ def run_headless(cams, user, password, path, rec=None, web=None, resync_min=0):
             if now - last_status > 600:
                 last_status = now
                 log_status(feeds, now)
+                if engine:
+                    log(f"detection: {engine.status()}")
             stop.wait(1)
     finally:
         stop.set()
@@ -1438,7 +2033,8 @@ def run_headless(cams, user, password, path, rec=None, web=None, resync_min=0):
         log("serve stopped")
 
 
-def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=False, rec=None, web=None):
+def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=False, rec=None, web=None,
+                det=None):
     """One window with every camera tiled. Each camera has its own ffmpeg and reconnect loop,
     so a slow or dead camera never freezes the others. Cameras are resynced (reconnected) on a
     staggered schedule so none drifts behind live; press r to resync all now.
@@ -1456,10 +2052,8 @@ def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=Fal
     cfg = load_saved()
     cfg_by_ip = {c["ip"]: c for c in cfg.get("cameras", [])}
     feeds = [CameraFeed(c, user, password, path, tw, th, stop, keep_every, cfg_by_ip.get(c["ip"]),
-                        gpu_scale, rec_root=rec and rec["dir"],
-                        rec_segment=rec["segment"] if rec else 300, web=bool(web),
-                        rec_format=rec["format"] if rec else "mkv") for c in cams]
-    web_view = start_extras(feeds, rec, web, user, password, stop)
+                        gpu_scale, **feed_opts(c, rec, web, det)) for c in cams]
+    web_view, engine = start_extras(feeds, rec, web, user, password, stop, det)
     for f in feeds:
         f.start()
 
@@ -1497,8 +2091,9 @@ def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=Fal
           f"Auto-resync: {'every %s min per camera (staggered)' % resync_min if resync_s else 'off'}."
           "  A dark grey tile = that camera has no live video right now.")
     print(" Click the video window first so it receives the keys.")
-    if rec or web_view:
+    if rec or web_view or engine:
         print_extras(rec, web_view, n)
+        print_detection(det, engine)
     print(bar)
 
     # Pre-render name labels (toggle with n)
@@ -1613,6 +2208,43 @@ def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=Fal
                     frame[o:o + cb] = val * cb
                     frame[o + cw - cb:o + cw] = val * cb
 
+    def yuv_of(hexcol):
+        r, g, b = (int(hexcol[i:i + 2], 16) for i in (1, 3, 5))
+        y = 16 + (65.481 * r + 128.553 * g + 24.966 * b) / 255
+        u = 128 + (-37.797 * r - 74.203 * g + 112.0 * b) / 255
+        v = 128 + (112.0 * r - 93.786 * g - 18.214 * b) / 255
+        return bytes([int(y)]), bytes([int(u)]), bytes([int(v)])
+
+    def paint_dets(x0, y0, dets):
+        """Outline each detected object on its tile, in its label's colour (4 px)."""
+        b = 4
+        for label, _score, fx1, fy1, fx2, fy2 in dets:
+            cy, cu, cv = yuv_of(label_color(label))
+            x1 = x0 + max(0, min(tw - b, int(fx1 * tw))) // 2 * 2
+            y1 = y0 + max(0, min(th - b, int(fy1 * th))) // 2 * 2
+            x2 = x0 + max(b, min(tw, int(fx2 * tw))) // 2 * 2
+            y2 = y0 + max(b, min(th, int(fy2 * th))) // 2 * 2
+            if x2 - x1 < 2 * b or y2 - y1 < 2 * b:
+                continue
+            w = x2 - x1
+            for r in list(range(y1, y1 + b)) + list(range(y2 - b, y2)):      # top + bottom
+                o = r * W + x1
+                frame[o:o + w] = cy * w
+            for r in range(y1 + b, y2 - b):                                    # left + right
+                o = r * W
+                frame[o + x1:o + x1 + b] = cy * b
+                frame[o + x2 - b:o + x2] = cy * b
+            cw2, cb = w // 2, b // 2
+            for plane, val in ((0, cu), (1, cv)):
+                pbase = ysz + plane * csz
+                for r in range(y1 // 2, y2 // 2):
+                    o = pbase + r * CW
+                    if r < y1 // 2 + cb or r >= y2 // 2 - cb:
+                        frame[o + x1 // 2:o + x1 // 2 + cw2] = val * cw2
+                    else:
+                        frame[o + x1 // 2:o + x1 // 2 + cb] = val * cb
+                        frame[o + x2 // 2 - cb:o + x2 // 2] = val * cb
+
     # ---- Live layout: which camera sits in which slot ------------------------------------
     view = list(range(n))         # feed index shown in each slot, left-right, top-bottom
     hidden = []                   # feed indices hidden with d (kept in hiding order)
@@ -1656,7 +2288,7 @@ def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=Fal
         elif cmd == "hide":
             fi = view.pop(sel[0])
             hidden.append(fi)
-            if not (feeds[fi].rec_root or feeds[fi].web):   # recording / browser view: stay connected
+            if not (feeds[fi].rec_root or feeds[fi].web or feeds[fi].detect):  # keep recording/serving/detecting
                 feeds[fi].paused = True
                 feeds[fi].restart(planned=True)            # disconnect it while hidden
             sel[0] = None
@@ -1747,12 +2379,14 @@ def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=Fal
                 if src is not None and stale != was_stale[i]:
                     was_stale[i] = stale
                     log(f"[{f.name}] tile greyed — no live video" if stale else f"[{f.name}] live again")
-                state = (i, f.frames, stale, show_names[0], layout_ver[0], sel[0] == slot)
+                state = (i, f.frames, stale, show_names[0], layout_ver[0], sel[0] == slot, f.dets_ver)
                 if state == painted[slot]:
                     continue                                     # nothing new since last paint
                 painted[slot] = state
                 if src is not None:
                     paint_tile(x0, y0, src, stale)
+                    if f.dets and not stale:
+                        paint_dets(x0, y0, f.dets)
                 if show_names[0] and labels[i]:
                     paint_label(x0, y0, labels[i])
                 if sel[0] == slot:
@@ -1838,19 +2472,40 @@ def play(args, password, cams=None):
     web = None
     if args.web is not None:
         web = {"port": args.web, "bind": args.web_bind}
+    det = None
+    if args.detect:
+        need("ffmpeg")
+        need_ai()
+        labels = {t.strip().lower().replace(" ", "_") for t in args.detect_labels.split(",") if t.strip()}
+        model = get_model(args.detect_model)
+        detector = Detector(model)                 # load now: fail early if the model is bad
+        known = set(detector.labels)
+        unknown = labels - known
+        if unknown:
+            die(f"this model doesn't know: {', '.join(sorted(unknown))}. It knows: "
+                + ", ".join(sorted(known)) + ("\n       (packages need a package-trained model: "
+                                               "--detect-model your_model.onnx)"
+                                               if "package" in unknown else ""))
+        det_cams = {c["ip"] for c in match_cams(cams, args.detect_cams)} if args.detect_cams else set()
+        fps = max(0.2, min(10.0, args.detect_fps))
+        det = {"model": model, "detector": detector, "labels": labels, "score": args.detect_score, "fps": fps,
+               "every": max(1, round(20 / fps)), "webhook": args.detect_webhook,
+               "cams": det_cams, "keep": args.detect_keep,
+               "events_dir": Path(args.detect_dir).expanduser() if args.detect_dir
+               else APP_DIR / "events"}
     if args.command == "serve":
         if not rec and not web:
             web = {"port": WEB_PORT, "bind": args.web_bind}   # serve alone = browser view
         run_headless(cams, user, password, path, rec, web,
-                     resync_min=args.resync if args.resync is not None else 0)
+                     resync_min=args.resync if args.resync is not None else 0, det=det)
     elif args.windows:
-        if rec or web:
-            die("--record / --web work with the grid or 'serve', not --windows")
+        if rec or web or det:
+            die("--record / --web / --detect work with the grid or 'serve', not --windows")
         play_windows(cams, user, password, path)
     else:
         play_mosaic(cams, user, password, path, fps=args.fps,
                     resync_min=args.resync if args.resync is not None else 10,
-                    gpu_scale=args.gpu, rec=rec, web=web)
+                    gpu_scale=args.gpu, rec=rec, web=web, det=det)
 
 
 # --------------------------------------------------------------------------- Home Assistant
@@ -2135,6 +2790,24 @@ def main():
                          "mp4 (fragmented; also plays in browsers, phones and Home Assistant)")
     ap.add_argument("--web", type=int, nargs="?", const=WEB_PORT, metavar="PORT",
                     help=f"also serve the browser view on PORT (default {WEB_PORT})")
+    ap.add_argument("--detect", action="store_true",
+                    help="local AI detection of people and pets (needs: pip install onnxruntime numpy)")
+    ap.add_argument("--detect-labels", default=DET_LABELS, metavar="LIST",
+                    help=f"what to detect (default {DET_LABELS}; e.g. add car,bird,truck)")
+    ap.add_argument("--detect-model", default="tiny", metavar="MODEL",
+                    help="nano (fastest), tiny (default), s (most accurate), or a path to your "
+                         "own ONNX model (YOLOX or YOLOv8/v9 layout; class names in <model>.txt)")
+    ap.add_argument("--detect-cams", metavar="LIST", help="detect only on these cameras (default: all)")
+    ap.add_argument("--detect-fps", type=float, default=DET_FPS, metavar="N",
+                    help=f"checks per second per camera (default {DET_FPS})")
+    ap.add_argument("--detect-score", type=float, default=DET_SCORE, metavar="0-1",
+                    help=f"minimum confidence (default {DET_SCORE})")
+    ap.add_argument("--detect-webhook", metavar="URL",
+                    help="POST each new detection as JSON to URL (e.g. a Home Assistant webhook)")
+    ap.add_argument("--detect-dir", metavar="DIR",
+                    help="where snapshots and events.jsonl go (default: events/ in the app folder)")
+    ap.add_argument("--detect-keep", type=int, default=DET_KEEP_DAYS, metavar="DAYS",
+                    help=f"keep snapshots/events this many days (default {DET_KEEP_DAYS}, 0 = forever)")
     ap.add_argument("--web-bind", default="0.0.0.0", metavar="ADDR",
                     help="address for the browser view (default 0.0.0.0 = your whole LAN; "
                          "127.0.0.1 = this computer only)")
