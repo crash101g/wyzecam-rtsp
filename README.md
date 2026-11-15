@@ -86,7 +86,65 @@ On Windows, use `py wyzecam-rtsp.py` wherever this says `./wyzecam-rtsp.py`.
 
 A **dark grey tile** means that camera has no live video right now. It keeps retrying on its own.
 
-## Record to a NAS (`--record`)
+## Record to your PC or a NAS (`--record`)
+
+### Recommended setup
+
+For most homes, start with the last 24 hours, recorded on this computer, as MP4:
+
+```
+./wyzecam-rtsp.py serve --record ~/Videos/wyzecams --rec-format mp4 --keep 1
+```
+
+- **Record locally first.** An internal drive or a USB drive (`/media/you/BigDrive/cams`) is the
+  simplest and most reliable option: there's no network share to mount and nothing that can drop
+  mid-recording. Use a NAS when you want recordings to survive this computer being stolen or
+  dying, or when the computer isn't on all the time.
+- **Use MP4 (`--rec-format mp4`).** The files open on phones, in browsers, in QuickTime and in
+  Home Assistant, so a clip is easy to share. They still survive a crash. Stay with the default
+  MKV only if you play everything in VLC or mpv.
+- **Keep 24 hours (`--keep 1`).** That's usually enough to look back at "what happened last
+  night", and it keeps disk use predictable. Raise it once you've measured your own cameras (see
+  below).
+- **Run `serve` on a machine that's always on.** Recording stops while the computer sleeps or is
+  off. `serve` also doesn't do the grid's 10-minute resync, so recordings have no gaps.
+- **Use `--sub` to save space** if detail isn't critical. Substreams take a fraction of the space
+  (see below).
+
+### How much disk space?
+
+The camera sets the bitrate (RTSP has no quality setting), and it changes with the scene. Motion,
+trees in wind, rain and night noise all use more space. These are planning figures, **per camera**:
+
+| Stream | Per hour | Per 24 hours (`--keep 1`) | Per 7 days (`--keep 7`) |
+|---|---|---|---|
+| Main stream (Cam v3 1080p / Cam v4 2.5K) | about 0.4–0.7 GB | about 10–16 GB | about 70–110 GB |
+| Substream (`--sub`) | about 0.15–0.2 GB | about 4–5 GB | about 25–35 GB |
+
+Multiply by the number of cameras. For example, **6 cameras on the main stream for 24 hours need
+about 60–100 GB**, and the same 6 kept for 7 days need about 0.4–0.7 TB. Leave at least 20% of the
+drive free.
+
+Where these numbers come from:
+- Wyze rates a 128 GB card at about 192 hours of HD video, which is about 0.6 GB per hour
+  ([Wyze](https://www.wyze.com/de/products/cam-v4-outdoor-bundle)).
+- Cam v4 owners report a little over 9 GB a day of continuous 2.5K recording
+  ([Wyze forum](https://forums.wyze.com/t/micro-sd-card-storage-continuous-recording-capacity/306346)).
+- Others see about 10 MB a minute, about 14 GB a day
+  ([Wyze forum](https://forums.wyze.com/t/sd-card-recording-and-hd-sd-360p-settings/342954)).
+- The substream figure is from Wyze's SD-quality rating (672 hours on 128 GB).
+
+The RTSP stream can differ from what the camera writes to its SD card, so **measure your own**:
+record for an hour, then check the folder sizes:
+
+```
+du -sh ~/Videos/wyzecams/*        # Linux/macOS: size per camera
+```
+
+On Windows, right-click each camera folder and choose Properties. Multiply each camera's hourly
+size by 24 × the days you keep.
+
+### Details
 
 ```
 ./wyzecam-rtsp.py --record /mnt/nas/cams                 # while watching the grid
