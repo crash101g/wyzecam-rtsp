@@ -240,8 +240,8 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
     <div class="txt">
       <div class="kicker">// nas recording</div>
       <h3>Your own NVR. No monthly fee.</h3>
-      <p>Point it at a mounted NAS share and every camera records into its own folder. Files are cut on the clock (every 5 minutes by default), so finding 2:15 pm takes one look.</p>
-      <ul><li>Video copied as-is, not re-encoded, so it barely uses any CPU</li><li><code>.mkv</code> files stay playable even after a power cut</li><li>Old recordings deleted automatically (<code>--keep 7</code>)</li><li>Hidden cameras keep recording</li></ul>
+      <p>Point it at a folder on your PC or a mounted NAS share, and every camera records into its own folder. Files are cut on the clock (every 5 minutes by default), so finding 2:15 pm takes one look.</p>
+      <ul><li>Video copied as-is, not re-encoded, so it barely uses any CPU</li><li>Crash-proof <code>.mkv</code>, or <code>--rec-format mp4</code> for files that play in any browser or phone</li><li>Old recordings deleted automatically: <code>--keep 1</code> keeps the last 24 hours, about 10–16 GB per camera</li><li>Records to this computer's drive or to a NAS share</li><li>Hidden cameras keep recording</li></ul>
       <code class="cmd">./wyzecam-rtsp.py serve --web --record /mnt/nas/cams</code>
     </div>
     <div><div class="shot"><img src="screenshots/record-serve.jpg" alt="Terminal running serve, next to a NAS folder of recordings" loading="lazy"></div><p class="cap">Illustrated mockup. The terminal text follows the real output format.</p></div>
