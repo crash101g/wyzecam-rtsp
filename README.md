@@ -197,6 +197,33 @@ video right now.
 - Decoding every camera for the browser costs CPU. On a small server, add `--sub` (substreams).
 - Windows: allow Python on **Private networks** if the firewall asks.
 
+## Play recordings in the browser
+
+When the browser view and recording are both on, the page gets a **▶ Recordings** button
+(or press **r**):
+
+```
+./wyzecam-rtsp.py serve --web --record ~/Videos/wyzecams --rec-format mp4 --keep 1 --detect
+```
+
+![Recordings view: player and a timeline per camera with event markers](docs/screenshots/playback.jpg)
+
+*Real capture: two test cameras, 1-hour zoom. The markers are detection events.*
+
+- **A timeline per camera** for the day. Shaded parts were recorded; gaps are times nothing was
+  recorded.
+- **Click anywhere** on a timeline to play from that moment. Files play on into the next one, so
+  it watches like one long video.
+- **Event markers** (with `--detect`) use the box colours: red for people, green for pets, blue
+  for vehicles. Click a marker, or **▶ Play recording** in the events panel, to jump to 5 seconds
+  before the detection.
+- **◀ ▶** change the day, **24 h / 6 h / 1 h** zoom in, **« »** move earlier or later, and
+  **⬇ Download clip** saves the current file as MP4.
+- Works on phones. Live tiles pause while you're watching recordings, to save bandwidth.
+- **MKV recordings play too.** The first time a file is played, it's copied into a
+  browser-friendly MP4 (no re-encoding, about a second) and kept in a temp folder for 2 hours. The
+  file that's still recording plays up to the last minute or so.
+
 ## Local AI detection (`--detect`)
 
 Detects **people, dogs and cats** (plus cars, trucks, birds and 70 other things if you ask)

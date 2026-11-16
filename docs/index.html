@@ -149,7 +149,7 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
 <header class="hero"><div class="wrap">
   <span class="tag">● Live · Local · AI · Free</span>
   <h1>Every Wyze cam.<br><span class="grad">One screen. No cloud.</span></h1>
-  <p class="lede">wyzecam-rtsp finds your Wyze cameras on your network, shows them all in one live grid, records them to your PC or NAS, spots people and pets with AI that runs on your own computer, streams them to any browser and plugs them into Home Assistant. It's one Python file with no subscription and no Wyze app, and it runs on Linux, macOS and Windows.</p>
+  <p class="lede">wyzecam-rtsp finds your Wyze cameras on your network, shows them all in one live grid, records them to your PC or NAS so you can rewind them in any browser, spots people and pets with AI that runs on your own computer, streams them to any browser and plugs them into Home Assistant. It's one Python file with no subscription and no Wyze app, and it runs on Linux, macOS and Windows.</p>
   <div class="cta">
     <a class="btn primary" href="https://github.com/crash101g/wyzecam-rtsp">Get it on GitHub →</a>
     <a class="btn ghost" href="#new">See what's new</a>
@@ -178,6 +178,7 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
     <div class="card"><span class="new">NEW</span><div class="ic">💾</div><h3>Records to your NAS</h3><p>Saves clock-aligned files in one folder per camera, deletes old ones automatically, and barely uses any CPU.</p></div>
     <div class="card"><span class="new">NEW</span><div class="ic">🌐</div><h3>Browser view</h3><p>Watch every camera from any phone, laptop or TV browser on your home network, behind a password.</p></div>
     <div class="card"><span class="new">NEW</span><div class="ic">🏠</div><h3>Home Assistant</h3><p>One command prints exactly what to type into Home Assistant for each camera.</p></div>
+    <div class="card"><span class="new">NEW</span><div class="ic">⏯️</div><h3>Play recordings</h3><p>A timeline per camera in the browser. Click any moment, or any detection, to watch it.</p></div>
     <div class="card"><span class="new">NEW</span><div class="ic">🧠</div><h3>Local AI detection</h3><p>Spots people, pets and cars on your own computer. Boxes on the tiles, a snapshot per visit, and alerts to Home Assistant.</p></div>
     <div class="card"><span class="new">NEW</span><div class="ic">🖥️</div><h3>Server mode</h3><p><code>serve</code> runs with no window: recording and the browser view on a NAS, Pi, mini-PC or container.</p></div>
   </div>
@@ -279,6 +280,16 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
   </div>
   <div class="feature">
     <div class="txt">
+      <div class="kicker" id="playback">// playback</div>
+      <h3>Rewind anything. Right in the browser.</h3>
+      <p>Press <b>r</b> in the browser view to get a timeline for every camera. Click any moment to watch it, or click a detection marker to jump to 5 seconds before it happened.</p>
+      <ul><li>Plays straight through file after file, like one long video</li><li>Event markers in the box colours: people, pets, vehicles</li><li>24 h / 6 h / 1 h zoom, day picker, one-click MP4 download</li><li>Works on phones, and plays MKV recordings too</li></ul>
+      <code class="cmd">./wyzecam-rtsp.py serve --web --record ~/Videos/wyzecams --detect</code>
+    </div>
+    <div><div class="shot"><img src="screenshots/playback.jpg" alt="Recordings view with a timeline per camera and event markers" loading="lazy"></div><p class="cap">Real capture: two test cameras, 1-hour zoom</p></div>
+  </div>
+  <div class="feature">
+    <div class="txt">
       <div class="kicker">// proof</div>
       <h3>Not just a mockup: here it is running.</h3>
       <p>This is an unedited capture of the real browser view, serving four simulated cameras with test-pattern video. The login, live updates and per-camera status dots are all working.</p>
@@ -316,6 +327,7 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
         <li>Recording folder checked before start; camera names made safe for folders</li>
         <li><code>serve</code> with no window, reconnects included</li>
         <li><code>ha</code> output, including on Windows</li>
+        <li>Playback: timeline, click to play, event jumps, playing on into the next file, day/zoom, MP4 download, phone layout; MP4 and MKV recordings</li>
         <li>AI detection: people, dogs, cars and bicycles found in test footage; boxes in the grid and browser view; snapshots; events log; webhook; old events deleted</li>
       </ul>
     </div>
@@ -333,6 +345,7 @@ footer .wrap{display:flex;flex-wrap:wrap;justify-content:space-between;gap:16px}
         <li>Detection accuracy on real Wyze footage: night vision, rain, small or distant people</li>
         <li>Detection CPU load on your PC with all cameras on</li>
         <li>Bring-your-own YOLOv8/v9-style models (e.g. for packages)</li>
+        <li>Playback in Safari / on iPhone</li>
       </ul>
     </div>
   </div>

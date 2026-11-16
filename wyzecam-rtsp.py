@@ -36,7 +36,8 @@ RECORDING AND BROWSER VIEW (grid or 'serve'; each camera still uses ONE camera s
   --rec-format FMT   mkv (default: survives crashes) or mp4 (fragmented: plays in browsers/phones)
   --keep DAYS        delete recordings older than DAYS (default 7, 0 = keep forever)
   --segment MIN      minutes per recording file (default 5)
-  --web [PORT]       browser view at http://this-pc:PORT/ (default 8080), RTSP login required
+  --web [PORT]       browser view at http://this-pc:PORT/ (default 8080), RTSP login required;
+                     with --record it also plays recordings (timeline per camera; press r)
   --web-bind ADDR    127.0.0.1 = only this computer (default: whole LAN)
 
 LOCAL AI DETECTION (grid or 'serve'; one-time setup: pip install onnxruntime numpy)
@@ -296,6 +297,13 @@ def redact(url):
 
 
 # --------------------------------------------------------------------------- scan
+def stop_soon(stop):
+    """Set `stop` from a signal handler. Not directly: the handler runs in the main thread, and
+    if that thread is inside stop.wait() (or a second Ctrl+C lands inside the first handler),
+    Event.set() would wait forever for a lock the main thread already holds."""
+    threading.Thread(target=stop.set, daemon=True).start()
+
+
 def safe_name(name):
     """A camera name usable as a folder/file name on Linux, macOS and Windows (and inside
     ffmpeg's strftime pattern, so no '%')."""
@@ -571,7 +579,7 @@ def play_windows(cams, user, password, path):
         print("COSMIC: press Super+Y if the windows aren't tiled.")
 
     def shutdown(*_):
-        stop.set()
+        stop_soon(stop)
         for p in procs.values():
             if p.poll() is None:
                 p.terminate()
@@ -1683,19 +1691,67 @@ WEB_PAGE = """<!doctype html>
  .ev div{font-size:13px;color:#bbb}
  .ev b{display:block;color:#fff;font-size:14px}
  .ev em{font-style:normal;color:var(--c);font-weight:700}
+ #recbtn{position:fixed;left:8px;bottom:8px;z-index:20;background:#222;color:#eee;border:1px solid #444;
+      border-radius:8px;padding:6px 12px;font:600 13px system-ui,sans-serif;cursor:pointer;display:none}
+ #evbtn.withrec{left:136px}
+ #rec{position:fixed;inset:0;background:#111;z-index:35;display:none;flex-direction:column;overflow:hidden}
+ #rec.open{display:flex}
+ #rechead{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid #2a2a2a}
+ #rechead b{font-size:15px;margin-right:6px}
+ #rechead button{background:#222;color:#ddd;border:1px solid #3a3a3a;border-radius:6px;padding:4px 10px;
+      font:600 13px system-ui,sans-serif;cursor:pointer}
+ #rechead button.on{background:#3cf0ff;color:#000;border-color:#3cf0ff}
+ #rechead .sp{flex:1}
+ #recday{font:600 14px system-ui,sans-serif;min-width:118px;text-align:center}
+ #player{flex:1;min-height:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+      background:#000;position:relative}
+ #player video{width:100%;height:100%;object-fit:contain;background:#000}
+ #player .hint{position:absolute;color:#888;font-size:14px;text-align:center;padding:20px}
+ #pcap{display:flex;gap:12px;align-items:center;padding:6px 10px;font-size:13px;color:#bbb;
+      border-top:1px solid #2a2a2a;min-height:20px}
+ #pcap b{color:#fff} #pcap a{color:#3cf0ff;margin-left:auto}
+ #rows{max-height:42vh;overflow-y:auto;padding:6px 10px 12px}
+ .rrow{display:flex;align-items:center;gap:10px;margin:6px 0}
+ .rrow .rn{width:120px;flex:none;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+ .bar{position:relative;flex:1;height:34px;background:#1d1d1d;border-radius:5px;cursor:pointer;overflow:hidden}
+ .bar .seg{position:absolute;top:0;bottom:0;background:#2f5d73}
+ .bar .mk{position:absolute;top:3px;bottom:3px;width:3px;margin-left:-1px;border-radius:2px;background:var(--c);
+      box-shadow:0 0 4px var(--c)}
+ .bar .ph{position:absolute;top:0;bottom:0;width:2px;background:#fff;display:none}
+ .bar .nw{position:absolute;top:0;bottom:0;width:1px;background:#ff4d4d;opacity:.7}
+ .ticks{position:relative;height:16px;margin:0 10px 0 140px;font-size:11px;color:#777}
+ .ticks span{position:absolute;transform:translateX(-50%);white-space:nowrap}
+ .ev .play{color:#3cf0ff;font-weight:700;margin-top:3px;display:inline-block}
+ @media (max-width:600px){.rrow .rn{width:70px}.ticks{margin-left:90px}#rows{max-height:38vh}}
  #full{position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:40;display:none;cursor:zoom-out}
  #full img{width:100%;height:100%;object-fit:contain}
 </style></head><body>
 <div id="grid"></div>
-<div id="bar">click a camera to zoom · n = names · f = fullscreen · e = events</div>
+<div id="bar">click a camera to zoom · n = names · f = fullscreen · e = events · r = recordings</div>
+<button id="recbtn">▶ Recordings</button>
 <button id="evbtn">Events<i id="evn">0</i></button>
+<div id="rec">
+ <div id="rechead"><b>Recordings</b>
+  <button id="dprev" title="previous day">◀</button><span id="recday"></span><button id="dnext" title="next day">▶</button>
+  <span class="sp"></span>
+  <button data-z="86400" class="on">24 h</button><button data-z="21600">6 h</button><button data-z="3600">1 h</button>
+  <button id="pprev" title="earlier">«</button><button id="pnext" title="later">»</button>
+  <button id="recclose">✕</button></div>
+ <div id="player"><video id="vid" controls playsinline preload="auto"></video>
+  <div class="hint" id="phint">Click a timeline below to play from that moment.</div></div>
+ <div id="pcap"><span id="pwhat"></span><a id="pdl" href="#" style="display:none">⬇ Download clip</a></div>
+ <div class="ticks" id="ticks"></div>
+ <div id="rows"></div>
+</div>
 <div id="events"><h3>Detections <a id="evclose">close ✕</a></h3><div id="evlist"></div></div>
 <div id="full"><img alt=""></div>
 <script>
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+let recOpen = false;
 async function feed(cam, tile, img) {
   let seq = 0, url = null;
   for (;;) {
+    if (recOpen) { await sleep(500); continue; }             // paused while watching recordings
     try {
       const r = await fetch(`cam/${cam.id}.jpg?after=${seq}`, {cache: "no-store"});
       if (r.status !== 200) { tile.classList.add("down"); await sleep(2000); continue; }
@@ -1761,8 +1817,10 @@ async function events() {
         row.className = "ev"; row.style.setProperty("--c", color(e.label));
         row.innerHTML = `<img loading="lazy" src="events/${esc(e.snapshot)}" alt="">
           <div><b>${esc(e.camera)}</b><em>${esc(nice(e.label))}</em> ${Math.round(e.score * 100)}%<br>
-          ${esc(e.time.replace("T", " "))}</div>`;
-        row.onclick = () => { full.querySelector("img").src = `events/${e.snapshot}`; full.style.display = "block"; };
+          ${esc(e.time.replace("T", " "))}${hasRec ? '<br><span class="play">▶ Play recording</span>' : ""}</div>`;
+        row.querySelector("img").onclick = ev => { ev.stopPropagation();
+          full.querySelector("img").src = `events/${e.snapshot}`; full.style.display = "block"; };
+        row.onclick = () => hasRec ? jumpTo(e.cam_id, e.ts - 5) : row.querySelector("img").onclick(new Event("x"));
         evlist.append(row);
       }
     } catch (e) {}
@@ -1786,23 +1844,308 @@ fetch("api/cams", {cache: "no-store"}).then(r => r.json()).then(cams => {
     tiles[cam.id] = {tile, img, tags, boxes: []};
     feed(cam, tile, img);
   }
+  recCams = cams.filter(c => c.rec);
+  hasRec = recCams.length > 0;
+  if (hasRec) document.getElementById("recbtn").style.display = "block";
   if (cams.some(c => c.detect)) {
-    document.getElementById("evbtn").style.display = "block";
+    const eb = document.getElementById("evbtn");
+    eb.style.display = "block";
+    if (hasRec) eb.classList.add("withrec");
     detections(); events();
   }
 });
+
+// ---------------------------------------------------------------- recordings / playback
+let recCams = [], hasRec = false, recDay = null, viewSpan = 86400, viewStart = 0;
+const recData = {};                       // cam id -> {segs: [...], evs: [...]}
+let cur = null;                           // what's playing: {cam, i (segment index), seg}
+const vid = document.getElementById("vid"), recEl = document.getElementById("rec");
+const pad = n => String(n).padStart(2, "0");
+const dayOf = ts => { const d = new Date(ts * 1000); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
+const dayStart = day => new Date(day + "T00:00:00").getTime() / 1000;
+const hhmmss = ts => { const d = new Date(ts * 1000); return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; };
+const camName = id => (recCams.find(c => c.id === id) || {}).name || id;
+
+async function loadDay(day) {
+  recDay = day;
+  document.getElementById("recday").textContent = new Date(day + "T12:00:00")
+    .toLocaleDateString(undefined, {weekday: "short", month: "short", day: "numeric"});
+  let evs = [];
+  try { evs = await (await fetch(`api/events?date=${day}`, {cache: "no-store"})).json(); } catch (e) {}
+  await Promise.all(recCams.map(async c => {
+    let segs = [];
+    try { segs = await (await fetch(`api/recordings?cam=${c.id}&date=${day}`, {cache: "no-store"})).json(); } catch (e) {}
+    recData[c.id] = {segs, evs: evs.filter(e => e.cam_id === c.id)};
+  }));
+  render();
+}
+function clampView() {
+  const d0 = dayStart(recDay);
+  viewStart = Math.max(d0, Math.min(d0 + 86400 - viewSpan, viewStart));
+}
+function xpct(t) { return (t - viewStart) / viewSpan * 100; }
+function render() {
+  clampView();
+  const rows = document.getElementById("rows"), ticks = document.getElementById("ticks");
+  rows.textContent = ""; ticks.textContent = "";
+  const step = viewSpan > 43200 ? 10800 : viewSpan > 7200 ? 3600 : 600;
+  for (let t = Math.ceil(viewStart / step) * step; t < viewStart + viewSpan - step / 4; t += step) {
+    const sp = document.createElement("span");
+    sp.style.left = xpct(t) + "%"; sp.textContent = hhmmss(t).slice(0, 5); ticks.append(sp);
+  }
+  const now = Date.now() / 1000;
+  for (const c of recCams) {
+    const d = recData[c.id] || {segs: [], evs: []};
+    const row = document.createElement("div"), name = document.createElement("div"), bar = document.createElement("div");
+    row.className = "rrow"; name.className = "rn"; name.textContent = c.name; name.title = c.name;
+    bar.className = "bar"; bar.dataset.cam = c.id;
+    for (const s of d.segs) {
+      if (s.end < viewStart || s.start > viewStart + viewSpan) continue;
+      const g = document.createElement("div");
+      g.className = "seg";
+      g.style.left = Math.max(0, xpct(s.start)) + "%";
+      g.style.width = Math.max(0.15, Math.min(100, xpct(s.end)) - Math.max(0, xpct(s.start))) + "%";
+      bar.append(g);
+    }
+    for (const e of d.evs) {
+      if (e.ts < viewStart || e.ts > viewStart + viewSpan) continue;
+      const m = document.createElement("div");
+      m.className = "mk"; m.style.left = xpct(e.ts) + "%"; m.style.setProperty("--c", color(e.label));
+      m.title = `${nice(e.label)} ${hhmmss(e.ts)}`;
+      m.onclick = ev => { ev.stopPropagation(); jumpTo(c.id, e.ts - 5); };
+      bar.append(m);
+    }
+    if (now > viewStart && now < viewStart + viewSpan) {
+      const nw = document.createElement("div"); nw.className = "nw"; nw.style.left = xpct(now) + "%"; bar.append(nw);
+    }
+    const ph = document.createElement("div"); ph.className = "ph"; bar.append(ph);
+    bar.onclick = ev => {
+      const r = bar.getBoundingClientRect();
+      play(c.id, viewStart + (ev.clientX - r.left) / r.width * viewSpan);
+    };
+    row.append(name, bar); rows.append(row);
+  }
+  playhead();
+}
+function playhead() {
+  document.querySelectorAll(".bar .ph").forEach(p => p.style.display = "none");
+  if (!cur) return;
+  const t = cur.seg.start + (vid.currentTime || 0);
+  const bar = document.querySelector(`.bar[data-cam="${cur.cam}"]`);
+  if (!bar || t < viewStart || t > viewStart + viewSpan) return;
+  const p = bar.querySelector(".ph"); p.style.display = "block"; p.style.left = xpct(t) + "%";
+  document.getElementById("pwhat").innerHTML = `<b>${esc(camName(cur.cam))}</b> ${hhmmss(t)}`;
+}
+function play(camId, t, idx) {
+  const segs = (recData[camId] || {}).segs || [];
+  // Files overlap by a moment (each ends a little after the next begins): take the latest.
+  let i = idx !== undefined ? idx : segs.findLastIndex(s => t >= s.start && t < s.end);
+  if (i < 0) i = segs.findIndex(s => s.start > t);          // in a gap: start at the next recording
+  const hint = document.getElementById("phint");
+  if (i < 0) { hint.textContent = "No recording at that time."; hint.style.display = "block"; return; }
+  const seg = segs[i];
+  cur = {cam: camId, i, seg};
+  hint.textContent = "Loading…"; hint.style.display = "block";
+  const url = `rec/${camId}/${encodeURIComponent(seg.file)}?v=${Math.floor(seg.end)}`;
+  vid.src = url;
+  const dl = document.getElementById("pdl"); dl.href = url + "&dl=1"; dl.style.display = "";
+  vid.onloadedmetadata = () => {
+    vid.currentTime = Math.max(0, Math.min(t - seg.start, (vid.duration || 1) - 0.5));
+    vid.play().catch(() => {});
+    hint.style.display = "none";
+  };
+  vid.onerror = () => { hint.textContent = "Couldn't play this recording."; hint.style.display = "block"; };
+}
+function next() {                                         // roll into the next file
+  if (!cur || cur.rolled) return;
+  const segs = recData[cur.cam].segs, nx = segs[cur.i + 1];
+  if (nx) { cur.rolled = true; play(cur.cam, nx.start, cur.i + 1); }
+}
+vid.addEventListener("timeupdate", () => {
+  playhead();
+  // Recordings' audio and video can end a few frames apart, so the browser may stall just
+  // short of the end instead of firing "ended": move on when we're within half a second.
+  if (vid.duration && vid.duration - vid.currentTime < 0.5) next();
+});
+vid.addEventListener("ended", next);
+async function jumpTo(camId, t) {
+  openRec(true);
+  const day = dayOf(t);
+  if (day !== recDay || !recData[camId]) await loadDay(day);
+  if (viewSpan === 86400) viewStart = dayStart(day); else viewStart = t - viewSpan / 2;
+  render();
+  play(camId, t);
+}
+function openRec(on) {
+  recOpen = on === undefined ? !recEl.classList.contains("open") : on;
+  recEl.classList.toggle("open", recOpen);
+  panel.classList.remove("open");
+  if (recOpen && !recDay) { viewStart = dayStart(dayOf(Date.now() / 1000)); loadDay(dayOf(Date.now() / 1000)); }
+  if (!recOpen) vid.pause();
+}
+function shiftDay(n) {
+  const d = new Date(recDay + "T12:00:00"); d.setDate(d.getDate() + n);
+  const day = dayOf(d.getTime() / 1000); viewStart = dayStart(day); loadDay(day);
+}
+document.getElementById("recbtn").onclick = () => openRec(true);
+document.getElementById("recclose").onclick = () => openRec(false);
+document.getElementById("dprev").onclick = () => shiftDay(-1);
+document.getElementById("dnext").onclick = () => shiftDay(1);
+document.getElementById("pprev").onclick = () => { viewStart -= viewSpan / 2; render(); };
+document.getElementById("pnext").onclick = () => { viewStart += viewSpan / 2; render(); };
+document.querySelectorAll("#rechead [data-z]").forEach(b => b.onclick = () => {
+  const center = cur ? cur.seg.start + vid.currentTime : viewStart + viewSpan / 2;
+  viewSpan = +b.dataset.z; viewStart = center - viewSpan / 2;
+  document.querySelectorAll("#rechead [data-z]").forEach(x => x.classList.toggle("on", x === b));
+  render();
+});
+setInterval(() => {                                          // today: keep the timeline fresh
+  if (recOpen && recDay === dayOf(Date.now() / 1000)) loadDay(recDay);
+}, 30000);
 document.addEventListener("keydown", e => {
   if (e.key === "n") document.body.classList.toggle("names-off");
   if (e.key === "f") document.fullscreenElement ? document.exitFullscreen()
                                                  : document.documentElement.requestFullscreen();
+  if (e.target.tagName === "INPUT") return;
   if (e.key === "e" && document.getElementById("evbtn").style.display === "block") toggleEvents();
+  if (e.key === "r" && hasRec) openRec();
   if (e.key === "Escape") {
     document.querySelectorAll(".zoom").forEach(t => t.classList.remove("zoom"));
     panel.classList.remove("open"); full.style.display = "none";
+    if (recOpen) openRec(false);
   }
 });
 </script></body></html>
 """
+
+
+REC_NAME = re.compile(r"[^/\\]+_(\d{4}-\d\d-\d\d)_(\d\d)-(\d\d)-(\d\d)\.(mkv|mp4)")
+
+
+class Recordings:
+    """Playback for the browser view: lists each camera's recordings for a day, and turns a
+    recording into a browser-friendly MP4 the first time it's played. That's a copy (no
+    re-encoding, ~1 s for a 5-minute file) with the index at the front, so the browser can
+    jump anywhere in it; MKV recordings play this way too. Copies live in a temp folder
+    and are deleted after PLAY_CACHE_HOURS."""
+    PLAY_CACHE_HOURS = 2
+
+    def __init__(self, root, events_dir):
+        self.root = Path(root) if root else None
+        self.events_dir = Path(events_dir) if events_dir else None
+        self.cache = Path(tempfile.gettempdir()) / "wyzecam-rtsp-play"
+        self.locks = {}
+        self.lock = threading.Lock()
+
+    def folder(self, feed):
+        return self.root / safe_name(feed.name)
+
+    def days(self, feed):
+        out = set()
+        if self.root:
+            for p in self.folder(feed).glob("*_????-??-??_??-??-??.*"):
+                m = REC_NAME.fullmatch(p.name)
+                if m:
+                    out.add(m.group(1))
+        return sorted(out)
+
+    def list(self, feed, day):
+        """[{file, start, end, size}] for one day. start comes from the file name (the clock
+        time it began); end is when it was last written to."""
+        segs = []
+        if not self.root:
+            return segs
+        for p in self.folder(feed).glob(f"*_{day}_??-??-??.*"):
+            m = REC_NAME.fullmatch(p.name)
+            if not m:
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            if st.st_size < 4096:
+                continue
+            start = time.mktime(time.strptime(f"{m.group(1)} {m.group(2)}:{m.group(3)}:{m.group(4)}",
+                                              "%Y-%m-%d %H:%M:%S"))
+            segs.append({"file": p.name, "start": start, "end": max(start + 1, st.st_mtime),
+                         "size": st.st_size})
+        segs.sort(key=lambda s: s["start"])
+        return segs
+
+    def events(self, day):
+        """Detection events (starts) for one day, from events.jsonl."""
+        out = []
+        jl = self.events_dir / "events.jsonl" if self.events_dir else None
+        try:
+            with open(jl) as fh:
+                for ln in fh:
+                    if f'"time": "{day}T' not in ln:
+                        continue
+                    try:
+                        ev = json.loads(ln)
+                    except ValueError:
+                        continue
+                    if ev.get("type") == "start":
+                        out.append(ev)
+        except (OSError, TypeError):
+            pass
+        return out[-3000:]
+
+    def source(self, feed, name):
+        if not self.root or not REC_NAME.fullmatch(name):
+            return None
+        p = self.folder(feed) / name
+        return p if p.is_file() else None
+
+    def playable(self, src, version=None):
+        """Path of a browser-friendly MP4 copy of `src`, made once per version. The page asks
+        for a version (the file's end time from the listing), so a file that's still being
+        recorded stays the same copy while it's played, instead of changing under the player."""
+        st = src.stat()
+        ver = re.sub(r"\D", "", str(version))[:16] if version else f"{st.st_size}_{int(st.st_mtime)}"
+        key = re.sub(r"[^\w-]", "_", f"{src.parent.name}_{src.stem}_{ver}")
+        out = self.cache / f"{key}.mp4"
+        if out.is_file():
+            return out
+        with self.lock:
+            lk = self.locks.setdefault(key, threading.Lock())
+        with lk:
+            if out.is_file():
+                return out
+            self.cache.mkdir(parents=True, exist_ok=True)
+            self._clean()
+            tag = []
+            try:
+                codec = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                                        "-show_entries", "stream=codec_name", "-of", "csv=p=0",
+                                        str(src)], capture_output=True, text=True, timeout=20).stdout
+                if "hevc" in codec:
+                    tag = ["-tag:v", "hvc1"]              # Safari/iPhone need this for H.265
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+            tmp = out.with_name(out.stem + ".part.mp4")
+            r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src), "-map", "0:v:0",
+                                "-map", "0:a:0?", "-c", "copy", *tag, "-movflags", "+faststart",
+                                str(tmp)], capture_output=True, timeout=180)
+            if r.returncode != 0 or not tmp.is_file():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise OSError(r.stderr.decode(errors="replace").strip()[-300:] or "ffmpeg failed")
+            tmp.replace(out)
+        with self.lock:
+            self.locks.pop(key, None)
+        return out
+
+    def _clean(self):
+        cutoff = time.time() - self.PLAY_CACHE_HOURS * 3600
+        for p in self.cache.glob("*.mp4"):
+            try:
+                if p.stat().st_mtime < cutoff:
+                    p.unlink()
+            except OSError:
+                pass
 
 
 def cam_ids(cams):
@@ -1817,12 +2160,14 @@ class WebView:
       /cam/ID.jpg    newest snapshot (?after=SEQ waits for a newer one; used by the page)
       /cam/ID.mjpg   MJPEG stream, for Home Assistant, VLC, mpv, etc.
       /api/cams      camera list (JSON)
+      /api/recordings?cam=ID&date=YYYY-MM-DD, /api/days?cam=ID, /api/events?date=...
+      /rec/ID/FILE   a recording, as a browser-friendly MP4 (supports seeking; ?dl=1 downloads)
     Protected by the RTSP username/password (HTTP Basic auth)."""
-    def __init__(self, feeds, port, bind, user, password, stop, engine=None):
+    def __init__(self, feeds, port, bind, user, password, stop, engine=None, recs=None):
         import base64
         import hmac
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-        from urllib.parse import parse_qs, urlsplit
+        from urllib.parse import parse_qs, unquote, urlsplit
         self.by_id = dict(zip(cam_ids([f.cam for f in feeds]), feeds))
         expect = ("Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()) if password else None
         by_id = self.by_id
@@ -1843,6 +2188,40 @@ class WebView:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def send_file(self, path, ctype, extra=None):
+                """Send a file, honouring a Range request (browsers need that to seek video)."""
+                size = path.stat().st_size
+                start, end = 0, size - 1
+                rng = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", "").strip())
+                if rng and (rng.group(1) or rng.group(2)):
+                    if rng.group(1):
+                        start = int(rng.group(1))
+                        end = min(size - 1, int(rng.group(2))) if rng.group(2) else size - 1
+                    else:                                    # "bytes=-N": the last N bytes
+                        start = max(0, size - int(rng.group(2)))
+                    if start > end or start >= size:
+                        return self.send(416, b"", extra={"Content-Range": f"bytes */{size}"})
+                    self.send_response(206)
+                    self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+                else:
+                    self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(end - start + 1))
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Cache-Control", "private, max-age=60")
+                for k, v in (extra or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
+                with open(path, "rb") as fh:
+                    fh.seek(start)
+                    left = end - start + 1
+                    while left > 0:
+                        chunk = fh.read(min(262144, left))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        left -= len(chunk)
+
             def do_GET(self):
                 if expect and not hmac.compare_digest(self.headers.get("Authorization", ""), expect):
                     return self.send(401, b"login required\n",
@@ -1855,12 +2234,47 @@ class WebView:
                     now = time.time()
                     data = [{"id": i, "name": f.name, "ip": f.cam["ip"],
                              "live": bool(f.jpeg_time and now - f.jpeg_time < STALL_SECS),
-                             "detect": bool(engine and f.detect)}
+                             "detect": bool(engine and f.detect),
+                             "rec": bool(recs and recs.root)}
                             for i, f in by_id.items()]
                     return self.send(200, json.dumps(data).encode(), "application/json")
                 if u.path == "/api/detections":
                     data = {i: f.dets for i, f in by_id.items() if f.detect}
                     return self.send(200, json.dumps(data).encode(), "application/json")
+                q = parse_qs(u.query)
+                if u.path in ("/api/recordings", "/api/days"):
+                    f = by_id.get(q.get("cam", [""])[0])
+                    if not f or not recs:
+                        return self.send(404, b"not found\n")
+                    if u.path == "/api/days":
+                        data = recs.days(f)
+                    else:
+                        day = q.get("date", [time.strftime("%Y-%m-%d")])[0]
+                        if not re.fullmatch(r"\d{4}-\d\d-\d\d", day):
+                            return self.send(400, b"bad date\n")
+                        data = recs.list(f, day)
+                    return self.send(200, json.dumps(data).encode(), "application/json")
+                if u.path == "/api/events" and "date" in q:
+                    day = q["date"][0]
+                    if not re.fullmatch(r"\d{4}-\d\d-\d\d", day):
+                        return self.send(400, b"bad date\n")
+                    data = recs.events(day) if recs else []
+                    return self.send(200, json.dumps(data).encode(), "application/json")
+                rm = re.fullmatch(r"/rec/([\w-]+)/([^/]+)", u.path)
+                if rm:
+                    f = by_id.get(rm.group(1))
+                    src = recs.source(f, unquote(rm.group(2))) if (f and recs) else None
+                    if not src:
+                        return self.send(404, b"no such recording\n")
+                    try:
+                        mp4 = recs.playable(src, q.get("v", [None])[0])
+                    except (OSError, subprocess.TimeoutExpired) as e:
+                        log(f"playback: couldn't prepare {src.name}: {e}")
+                        return self.send(500, b"couldn't prepare this recording\n")
+                    extra = {}
+                    if q.get("dl"):
+                        extra["Content-Disposition"] = f'attachment; filename="{src.stem}.mp4"'
+                    return self.send_file(mp4, "video/mp4", extra)
                 if u.path == "/api/events":
                     try:
                         limit = max(1, min(300, int(parse_qs(u.query).get("limit", ["100"])[0])))
@@ -1869,8 +2283,9 @@ class WebView:
                     data = engine.events(limit) if engine else []
                     return self.send(200, json.dumps(data).encode(), "application/json")
                 ev = re.fullmatch(r"/events/(\d{4}-\d\d-\d\d/[\w.\-]+\.jpg)", u.path)
-                if ev and engine:
-                    f = engine.root / ev.group(1)
+                ev_root = engine.root if engine else (recs.events_dir if recs else None)
+                if ev and ev_root:
+                    f = ev_root / ev.group(1)
                     try:
                         return self.send(200, f.read_bytes(), "image/jpeg")
                     except OSError:
@@ -1947,7 +2362,9 @@ def start_extras(feeds, rec, web, user, password, stop, det=None):
         Pruner(rec["dir"], rec["keep"], stop).start()
     engine = start_detection(feeds, det, stop)
     if web:
-        web_view = WebView(feeds, web["port"], web["bind"], user, password, stop, engine)
+        events_dir = det["events_dir"] if det else APP_DIR / "events"
+        recs = Recordings(rec["dir"] if rec else None, events_dir)
+        web_view = WebView(feeds, web["port"], web["bind"], user, password, stop, engine, recs)
     return web_view, engine
 
 
@@ -1991,7 +2408,7 @@ def run_headless(cams, user, password, path, rec=None, web=None, resync_min=0, d
     next_resync = [t0 + resync_s + i * resync_s / n if resync_s else float("inf") for i in range(n)]
 
     def shutdown(*_):
-        stop.set()
+        stop_soon(stop)
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
@@ -2132,7 +2549,7 @@ def play_mosaic(cams, user, password, path, fps=15, resync_min=15, gpu_scale=Fal
     ipc = MpvIPC(sock_path, on_msg, stop)
 
     def shutdown(*_):
-        stop.set()
+        stop_soon(stop)
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
